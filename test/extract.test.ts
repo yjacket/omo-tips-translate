@@ -1,8 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { existsSync } from "node:fs";
 import {
 	POINTER_EN,
 	PREFIX_EN,
@@ -12,7 +19,43 @@ import {
 	sourceHash,
 } from "../src/extract";
 
-const RUNTIME_ROOT = "C:/Users/yjack/.omo/agent/runtime/0b0c6ca88f3a3632-7e186e28b781";
+const RUNTIME_PARENT = join(homedir(), ".omo", "agent", "runtime");
+
+function hasBundle(root: string): boolean {
+	return existsSync(join(root, "dist", "bundle"));
+}
+
+function newestRuntimeRoot(): string | null {
+	try {
+		const candidates = readdirSync(RUNTIME_PARENT, { withFileTypes: true })
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => join(RUNTIME_PARENT, entry.name))
+			.filter(hasBundle);
+		candidates.sort((a, b) => {
+			const mtime = statSync(b).mtimeMs - statSync(a).mtimeMs;
+			return mtime !== 0 ? mtime : b.localeCompare(a);
+		});
+		return candidates[0] ?? null;
+	} catch {
+		return null;
+	}
+}
+
+const envRuntimeRoot = process.env.OMO_TIPS_RUNTIME_ROOT?.trim();
+const discoveredRuntimeRoot = envRuntimeRoot ? null : newestRuntimeRoot();
+const RUNTIME_ROOT = envRuntimeRoot || discoveredRuntimeRoot;
+const runtimeAvailable = RUNTIME_ROOT !== null && hasBundle(RUNTIME_ROOT);
+const runtimeReason = envRuntimeRoot
+	? `${envRuntimeRoot} (from OMO_TIPS_RUNTIME_ROOT) has no dist/bundle`
+	: `no directory under ${RUNTIME_PARENT} contains dist/bundle`;
+
+if (runtimeAvailable) {
+	console.log(
+		`[extract] real runtime root: ${RUNTIME_ROOT} (${envRuntimeRoot ? "OMO_TIPS_RUNTIME_ROOT" : `newest under ${RUNTIME_PARENT}`})`,
+	);
+} else {
+	console.log(`[extract] real runtime test SKIPPED: ${runtimeReason}`);
+}
 
 test("exports the exact runtime prefix and pointer strings", () => {
 	expect(PREFIX_EN).toBe("Tip: ");
@@ -222,19 +265,13 @@ describe("sourceHash", () => {
 	});
 });
 
-const runtimeAvailable =
-	existsSync(RUNTIME_ROOT) && existsSync(join(RUNTIME_ROOT, "dist"));
-
 describe(
 	runtimeAvailable
 		? "loadTemplates against the real runtime (WILL RUN)"
 		: "loadTemplates against the real runtime (SKIPPED: runtime not found)",
 	() => {
 		test("loads >= 50 templates and the exact computer.stop-chord string", () => {
-			if (!runtimeAvailable) {
-				console.log(`[extract] real runtime test SKIPPED: ${RUNTIME_ROOT} is unavailable`);
-				return;
-			}
+			if (!runtimeAvailable || RUNTIME_ROOT === null) return;
 			const started = performance.now();
 			const result = loadTemplates(RUNTIME_ROOT);
 			console.log(

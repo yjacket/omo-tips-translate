@@ -11,7 +11,7 @@ An OMO (senpi) extension that shows the TUI tips in the language you choose. "Ti
 ↳ 각 팁의 자세한 설명이 궁금하세요? 물어보세요 — give-me-tips 스킬에 안내가 있습니다.
 ```
 
-The first run takes a few moments to translate the catalog in the background. The tips already translated appear as they arrive; the session is never blocked waiting for the whole catalog. A status line shows progress, for example `🌐 팁 12/180`.
+The first run takes a few moments to translate the whole catalog in the background. Tips are shown in English until every batch finishes, then the translated table is installed at once; translations do not appear batch by batch. The session is never blocked waiting for the catalog. A status line shows progress, for example `🌐 팁 12/180`.
 
 ## Install
 
@@ -78,7 +78,7 @@ The file is yours to delete. Deleting it makes the next session ask for a model 
 
 ## How it works and safety
 
-The extension wraps `Text.prototype.render` from `@earendil-works/pi-tui`, the path every tip line goes through, and only touches strings that contain the English tip pointer. The catalog is read from the running OMO installation at `dist/bundle/chunks/*.js`, falling back to `dist/modes/interactive/tips/catalog/*-tips.js`. The English text is parsed with a hand-written scanner, never `eval` or `Function`.
+The extension wraps `Text.prototype.render` from `@earendil-works/pi-tui`, the path every tip line goes through, and only touches lines that start with `Tip: ` and the exact English pointer line. The catalog is read from the running OMO installation at `dist/bundle/chunks/*.js`, falling back to `dist/modes/interactive/tips/catalog/*-tips.js`. The English text is parsed with a hand-written scanner, never `eval` or `Function`.
 
 - **No runtime edits.** The extension never writes OMO's files or `settings.json`. Rendering is changed only in memory.
 - **English fallback.** A missing translation, a placeholder mismatch, a corrupt store file, or a missing internal leaves the original English text in place.
@@ -99,7 +99,7 @@ The extension wraps `Text.prototype.render` from `@earendil-works/pi-tui`, the p
 bun test
 ```
 
-The tests are `bun:test` unit tests for the pure modules: catalog extraction and hashing, matching with placeholders and ANSI codes, the atomic store and cross-session lock, and batched translation validation. They use fake modules and temporary directories, never a live OMO session, and they do not sleep. Live TUI checks are described in [CLAUDE.md](CLAUDE.md). The package requires Bun >= 1.4.
+The tests are `bun:test` unit tests for the pure modules and the extension wiring. They cover catalog extraction and hashing, matching with placeholders and ANSI codes, the atomic store and cross-session lock, batched translation validation, and the extension's first-run, changed-hash, command, reload, missing-seam, and corrupt-store paths. Extension tests use fake senpi and pi-tui modules and fresh imports, never a live OMO session, and no test sleeps. An isolated live replay (`bun qa/live-replay.mjs`) drives a real TUI against a temporary agent directory; see [CLAUDE.md](CLAUDE.md). The package requires Bun >= 1.4.
 
 ## License
 
