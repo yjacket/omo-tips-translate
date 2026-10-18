@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import {
   closeSync,
   mkdirSync,
@@ -134,42 +135,61 @@ function lockAge(lock: string): number | undefined {
   }
 }
 
-export function acquireLock(path: string, now = Date.now()): boolean {
+export function acquireLockToken(path: string, now = Date.now()): string | undefined {
   const lock = `${path}.lock`;
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
+      const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
       const fd = openSync(lock, "wx");
       try {
-        writeSync(fd, JSON.stringify({ pid: process.pid, at: now }));
+        writeSync(fd, JSON.stringify({ pid: process.pid, token, at: now }));
       } finally {
         closeSync(fd);
       }
-      return true;
+      return token;
     } catch (error) {
       if (!isRecord(error) || error.code !== "EEXIST") {
-        return false;
+        return undefined;
       }
     }
 
     const at = lockAge(lock);
     if (at === undefined || now - at <= LOCK_STALE_MS) {
-      return false;
+      return undefined;
     }
 
     try {
       unlinkSync(lock);
     } catch {
-      return false;
+      return undefined;
     }
   }
 
-  return false;
+  return undefined;
 }
 
-export function releaseLock(path: string): void {
+export function acquireLock(path: string, now = Date.now()): boolean {
+  return acquireLockToken(path, now) !== undefined;
+}
+
+export function releaseLock(path: string, token?: string): void {
+  const lock = `${path}.lock`;
+
+  if (token !== undefined) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(lock, "utf8"));
+    } catch {
+      return;
+    }
+    if (!isRecord(parsed) || parsed.token !== token) {
+      return;
+    }
+  }
+
   try {
-    unlinkSync(`${path}.lock`);
+    unlinkSync(lock);
   } catch {
     // Releasing a missing lock is a no-op.
   }

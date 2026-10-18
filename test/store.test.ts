@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   acquireLock,
+  acquireLockToken,
   diffTemplates,
   readStore,
   releaseLock,
@@ -141,6 +142,47 @@ describe("acquireLock / releaseLock", () => {
     expect(acquireLock(path, now)).toBe(true);
     expect(existsSync(`${path}.lock`)).toBe(true);
     expect(acquireLock(path, now + 1)).toBe(false);
+  });
+
+  test("returns a unique owner token and records it in the lock file", () => {
+    const path = storePath(dir);
+
+    const token = acquireLockToken(path, 1_000);
+
+    expect(typeof token).toBe("string");
+    expect(token?.startsWith(`${process.pid}-`)).toBe(true);
+    expect(JSON.parse(readFileSync(`${path}.lock`, "utf8")).token).toBe(token);
+    expect(acquireLockToken(path, 1_001)).toBeUndefined();
+  });
+
+  test("releases only when the token matches", () => {
+    const path = storePath(dir);
+    const token = acquireLockToken(path, 1_000);
+
+    releaseLock(path, "someone-else");
+    expect(existsSync(`${path}.lock`)).toBe(true);
+
+    releaseLock(path, token);
+    expect(existsSync(`${path}.lock`)).toBe(false);
+  });
+
+  test("a token from a stale lock cannot release the new owner's lock", () => {
+    const path = storePath(dir);
+    const now = 2_000_000;
+    writeFileSync(
+      `${path}.lock`,
+      JSON.stringify({ pid: 123, token: "old", at: now - 10 * 60 * 1000 - 1 }),
+      "utf8",
+    );
+
+    const token = acquireLockToken(path, now);
+    expect(typeof token).toBe("string");
+
+    releaseLock(path, "old");
+    expect(existsSync(`${path}.lock`)).toBe(true);
+
+    releaseLock(path, token);
+    expect(existsSync(`${path}.lock`)).toBe(false);
   });
 
   test("releases the lock so it can be acquired again", () => {
