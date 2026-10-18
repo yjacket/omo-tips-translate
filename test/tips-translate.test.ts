@@ -122,6 +122,18 @@ class FakeUi {
 
 type Complete = (system: string, user: string) => Promise<string>;
 
+function flush(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
+}
+
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((done) => {
+		resolve = done;
+	});
+	return { promise, resolve };
+}
+
 function translatedJson(system: string, user: string): string {
 	const language = /translate into (.*?);/.exec(system)?.[1] ?? "TR";
 	const items = JSON.parse(user) as Record<string, string>;
@@ -454,6 +466,112 @@ describe("tips-translate session flow", () => {
 		expect(text.text).toBe("Tip: Hello world");
 	});
 
+	test("a second session adopts the store written by the first instead of translating again", async () => {
+		const root = runtimeRoot();
+		const agentDir = tempDir();
+		const registry = makeRegistry();
+
+		const firstUi = new FakeUi();
+		firstUi.selectQueue.push("fake/translator", "한국어");
+		const first = await load(makeHost({ root, agentDir, ui: firstUi, registry: registry.registry }));
+
+		const pendingSelects: Array<(value: string | undefined) => void> = [];
+		const secondUi = new FakeUi();
+		secondUi.select = () => new Promise<string | undefined>((resolve) => pendingSelects.push(resolve));
+		const second = await load(makeHost({ root, agentDir, ui: secondUi, registry: registry.registry }));
+		await second.fire("session_start");
+		expect(pendingSelects.length).toBe(1);
+
+		const firstDone = firstUi.waitFor(/번역했습니다/);
+		await first.fire("session_start");
+		await firstDone;
+
+		const adopted = secondUi.waitFor(/다른 세션이 번역한 결과를 사용합니다/);
+		pendingSelects.shift()!("fake/translator");
+		await flush();
+		expect(pendingSelects.length).toBe(1);
+		pendingSelects.shift()!("한국어");
+		await adopted;
+
+		expect(registry.calls.length).toBe(1);
+		expect(readStore(storePath(agentDir)).data!.language).toBe("한국어");
+		const text = new FakeText("Tip: Hello world");
+		text.render(120);
+		expect(text.text).toContain("«한국어»");
+	});
+
+	test("a second session answering while the first holds the lock notifies and does not call the model", async () => {
+		const root = runtimeRoot();
+		const agentDir = tempDir();
+		const gate = deferred<void>();
+		const started = deferred<void>();
+		const registry = makeRegistry({
+			complete: async (system, user) => {
+				started.resolve();
+				await gate.promise;
+				return translatedJson(system, user);
+			},
+		});
+
+		const firstUi = new FakeUi();
+		firstUi.selectQueue.push("fake/translator", "한국어");
+		const first = await load(makeHost({ root, agentDir, ui: firstUi, registry: registry.registry }));
+		const firstDone = firstUi.waitFor(/번역했습니다/);
+		await first.fire("session_start");
+		await started.promise;
+
+		const secondUi = new FakeUi();
+		secondUi.selectQueue.push("fake/translator", "한국어");
+		const second = await load(makeHost({ root, agentDir, ui: secondUi, registry: registry.registry }));
+		const held = secondUi.waitFor(/다른 세션이 팁을 번역 중입니다/);
+		await second.fire("session_start");
+		await held;
+
+		expect(registry.calls.length).toBe(1);
+		gate.resolve();
+		await firstDone;
+	});
+
+	test("declining in one session keeps a newer table written by another session", async () => {
+		const host = makeHost();
+		makeStore({ agentDir: host.agentDir, source: "older-hash", entries: {} });
+		const answer = deferred<boolean>();
+		let confirmCalls = 0;
+		host.ui.confirm = () => {
+			confirmCalls++;
+			return answer.promise;
+		};
+		const api = await load(host);
+		await api.fire("session_start");
+		expect(confirmCalls).toBe(1);
+
+		const newer = makeStore({
+			agentDir: host.agentDir,
+			source: catalogHash,
+			entries: { hello: { en: "Hello world", tr: "A의 새 번역" } },
+		});
+		expect(newer.sourceHash).toBe(catalogHash);
+
+		answer.resolve(false);
+		await flush();
+		const saved = readStore(storePath(host.agentDir)).data!;
+		expect(saved.declinedHash).toBe(catalogHash);
+		expect(saved.sourceHash).toBe(catalogHash);
+		expect(saved.table.entries.hello!.tr).toBe("A의 새 번역");
+	});
+
+	test("session_start resolves before first-run dialogs are answered", async () => {
+		const host = makeHost();
+		let selectCalls = 0;
+		host.ui.select = () => {
+			selectCalls++;
+			return new Promise<string | undefined>(() => {});
+		};
+		const api = await load(host);
+		await api.fire("session_start");
+		expect(selectCalls).toBe(1);
+	});
+
 	test("a reload shutdown removes the implementation and the next load restores it", async () => {
 		const host = makeHost();
 		makeStore({ agentDir: host.agentDir });
@@ -471,6 +589,30 @@ describe("tips-translate session flow", () => {
 		await second.fire("session_start");
 		text.render(120);
 		expect(text.text).toContain("«한국어»");
+	});
+
+	test("a session never releases a lock token taken over by a successor", async () => {
+		const gate = deferred<void>();
+		const started = deferred<void>();
+		const registry = makeRegistry({
+			complete: async (system, user) => {
+				started.resolve();
+				await gate.promise;
+				return translatedJson(system, user);
+			},
+		});
+		const host = makeHost({ registry: registry.registry });
+		host.ui.selectQueue.push("fake/translator", "한국어");
+		const done = host.ui.waitFor(/번역했습니다/);
+		await load(host).then((api) => api.fire("session_start"));
+		await started.promise;
+
+		const lock = `${storePath(host.agentDir)}.lock`;
+		writeFileSync(lock, JSON.stringify({ pid: 1, token: "successor", at: Date.now() }), "utf8");
+		gate.resolve();
+		await done;
+
+		expect(JSON.parse(readFileSync(lock, "utf8")).token).toBe("successor");
 	});
 
 	test("a failing model call notifies an error and leaves no store behind", async () => {
@@ -527,6 +669,53 @@ describe("tips-translate command", () => {
 		const text = new host.Text("Tip: Hello world");
 		text.render(120);
 		expect(text.text).toBe("«日本語» Tip: «日本語» Hello world");
+	});
+
+	test("다시 번역 with an unchanged store calls the model instead of adopting", async () => {
+		const registry = makeRegistry();
+		const host = makeHost({ registry: registry.registry });
+		makeStore({ agentDir: host.agentDir });
+		const api = await load(host);
+		await api.fire("session_start");
+
+		host.ui.selectQueue.push("다시 번역");
+		const done = host.ui.waitFor(/번역했습니다/);
+		await api.command("");
+		await done;
+
+		expect(registry.calls.length).toBe(1);
+		expect(host.ui.notices.some((notice) => notice.message.includes("다른 세션이 번역한 결과를 사용합니다"))).toBe(false);
+	});
+
+	test("a same-language argument calls the model instead of adopting", async () => {
+		const registry = makeRegistry();
+		const host = makeHost({ registry: registry.registry });
+		makeStore({ agentDir: host.agentDir, language: "한국어" });
+		const api = await load(host);
+		await api.fire("session_start");
+
+		const done = host.ui.waitFor(/번역했습니다/);
+		await api.command("한국어");
+		await done;
+
+		expect(registry.calls.length).toBe(1);
+		expect(host.ui.notices.some((notice) => notice.message.includes("다른 세션이 번역한 결과를 사용합니다"))).toBe(false);
+	});
+
+	test("changing the model in the menu retranslates with the chosen model", async () => {
+		const registry = makeRegistry();
+		const host = makeHost({ registry: registry.registry });
+		makeStore({ agentDir: host.agentDir });
+		const api = await load(host);
+		await api.fire("session_start");
+
+		host.ui.selectQueue.push("모델 바꾸기", "fake/other");
+		const done = host.ui.waitFor(/번역했습니다/);
+		await api.command("");
+		await done;
+
+		expect(registry.calls.length).toBe(1);
+		expect(readStore(storePath(host.agentDir)).data!.model).toEqual({ provider: "fake", id: "other" });
 	});
 
 	test("turning off in the menu restores English and turning on translates again", async () => {

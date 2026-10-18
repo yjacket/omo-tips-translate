@@ -19,7 +19,7 @@ import {
 } from "../src/extract";
 import { createMatcher, type Matcher, type Table } from "../src/match";
 import {
-	acquireLock,
+	acquireLockToken,
 	diffTemplates,
 	readStore,
 	releaseLock,
@@ -168,6 +168,7 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 	let problem: string | undefined;
 	let warnedSeam = false;
 	let warnedRender = false;
+	let warnedHeldLock = false;
 	let pendingWarning: string | undefined;
 
 	let TextClass: unknown;
@@ -187,6 +188,20 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 		} catch {
 			// A broken notifier must not break translation or rendering.
 		}
+	};
+
+	const notifyOn = (targetUi: Ui | undefined, message: string, level: "info" | "warning" | "error" = "info"): void => {
+		try {
+			targetUi?.notify?.(message, level);
+		} catch {
+			// A broken or stale notifier must not reject a background task.
+		}
+	};
+
+	const notifyHeldLock = (targetUi: Ui | undefined): void => {
+		if (warnedHeldLock) return;
+		warnedHeldLock = true;
+		notifyOn(targetUi, "다른 세션이 팁을 번역 중입니다. 끝나면 /reload로 반영됩니다");
 	};
 
 	const notifySeamOnce = (message: string): void => {
@@ -211,12 +226,18 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 		}
 	};
 
-	const setStatus = (text: string | undefined): void => {
+	const setStatus = (text: string | undefined, targetUi: Ui | undefined = ui): void => {
 		try {
-			ui?.setStatus?.("omo-tips-translate", text);
+			targetUi?.setStatus?.("omo-tips-translate", text);
 		} catch {
 			// Status is cosmetic.
 		}
+	};
+
+	const runBackground = (task: () => Promise<void>): void => {
+		void task().catch((error) => {
+			notifySeamOnce(`tips-translate: 백그라운드 오류 (${errorMessage(error)}). 팁은 영어로 표시됩니다.`);
+		});
 	};
 
 	const activate = (): void => {
@@ -333,77 +354,166 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 		};
 	};
 
+	const updateStoreUnderLock = (
+		path: string,
+		mutate: (fresh: StoreData) => StoreData,
+		targetUi: Ui | undefined,
+	): StoreData | undefined => {
+		const token = acquireLockToken(path);
+		if (!token) {
+			notifyHeldLock(targetUi);
+			return undefined;
+		}
+		try {
+			const read = readStore(path);
+			if (read.error !== undefined || !read.data) {
+				notifyOn(targetUi, `변경 사항을 저장하지 못했습니다: ${read.error ?? "저장된 번역이 없습니다"}`, "error");
+				return undefined;
+			}
+			const next = mutate(read.data);
+			writeStore(path, next);
+			store = next;
+			return next;
+		} catch (error) {
+			notifyOn(targetUi, `변경 사항을 저장하지 못했습니다: ${errorMessage(error)}`, "error");
+			return undefined;
+		} finally {
+			releaseLock(path, token);
+		}
+	};
+
 	const translate = async (
 		ctx: Context,
 		options: {
 			language: string;
-			model: ModelRef;
-			targets: TipTemplate[];
+			model?: ModelRef;
+			targets: TipTemplate[] | ((fresh: StoreData | undefined) => TipTemplate[]);
 			includeFixed: boolean;
-			base?: StoreData;
+			useFreshSettings?: boolean;
+			preferFreshModel?: boolean;
 			replaceEntries?: boolean;
+			requireModelMatch?: boolean;
+			adoptExisting?: boolean;
 		},
 	): Promise<void> => {
 		const currentUi = ctx.ui ?? ui;
 		const target = storePath(agentDir);
-		if (!acquireLock(target)) return;
+		const token = acquireLockToken(target);
+		if (!token) {
+			notifyHeldLock(currentUi);
+			return;
+		}
 
 		let done = 0;
-		let total = options.targets.length + (options.includeFixed ? 2 : 0);
-		setStatus(`🌐 팁 0/${total}`);
+		let total = 0;
 		try {
+			const fresh = readStore(target).data;
+			if (fresh) store = fresh;
+
+			const language = options.useFreshSettings && fresh ? fresh.language : options.language;
+			const requestedModel = options.model;
+			const model =
+				(options.preferFreshModel && fresh ? fresh.model : requestedModel) ?? fresh?.model ?? store?.model;
+			const sameModel =
+				fresh !== undefined &&
+				requestedModel !== undefined &&
+				fresh.model.provider === requestedModel.provider &&
+				fresh.model.id === requestedModel.id;
+			if (
+				options.adoptExisting !== false &&
+				fresh !== undefined &&
+				fresh.sourceHash === hash &&
+				fresh.language === language &&
+				(!options.requireModelMatch || sameModel)
+			) {
+				installMatcher(fresh.enabled ? fresh.table : undefined);
+				activate();
+				requestRender();
+				notifyOn(currentUi, "다른 세션이 번역한 결과를 사용합니다");
+				return;
+			}
+
+			const targets =
+				typeof options.targets === "function" ? options.targets(fresh) : options.targets;
+			if (targets.length === 0 && !options.includeFixed) {
+				if (fresh) {
+					const updated: StoreData = {
+						...fresh,
+						sourceHash: hash,
+						omoVersion: version,
+						updatedAt: new Date().toISOString(),
+					};
+					try {
+						writeStore(target, updated);
+						store = updated;
+						installMatcher(updated.enabled ? updated.table : undefined);
+					} catch (error) {
+						notifyOn(currentUi, `변경 사항을 저장하지 못했습니다: ${errorMessage(error)}`, "error");
+					}
+				}
+				return;
+			}
+
+			if (!model) {
+				notifyOn(currentUi, "번역에 사용할 모델이 없습니다. 팁은 영어로 표시됩니다.", "warning");
+				return;
+			}
+
+			total = targets.length + (options.includeFixed ? 2 : 0);
+			setStatus(`🌐 팁 0/${total}`, currentUi);
 			const result = await translateTemplates({
-				templates: options.targets,
-				language: options.language,
-				complete: completeFor(ctx, options.model),
+				templates: targets,
+				language,
+				complete: completeFor(ctx, model),
 				includeFixed: options.includeFixed,
 				onProgress: (nextDone, nextTotal) => {
 					done = nextDone;
 					total = nextTotal;
-					setStatus(`🌐 팁 ${done}/${total}`);
+					setStatus(`🌐 팁 ${done}/${total}`, currentUi);
 				},
 			});
 
 			if (Object.keys(result.entries).length === 0) {
-				currentUi?.notify?.("팁을 번역하지 못했습니다. 기존 번역을 유지하고 영어로 표시합니다.", "error");
+				notifyOn(currentUi, "팁을 번역하지 못했습니다. 기존 번역을 유지하고 영어로 표시합니다.", "error");
 				return;
 			}
 
-			const base = options.base ?? store;
+			const latest = readStore(target).data;
 			const data: StoreData = {
 				version: 1,
 				omoVersion: version,
 				sourceHash: hash,
-				model: { provider: options.model.provider, id: options.model.id },
-				language: options.language,
-				enabled: true,
-				...(base?.declinedHash !== undefined ? { declinedHash: base.declinedHash } : {}),
+				model: { provider: model.provider, id: model.id },
+				language,
+				enabled: latest?.enabled ?? true,
+				...(latest?.declinedHash !== undefined ? { declinedHash: latest.declinedHash } : {}),
 				table: options.replaceEntries
 					? {
 							prefix: result.prefix ?? PREFIX_EN,
 							pointer: result.pointer ?? POINTER_EN,
 							entries: result.entries,
 						}
-					: mergeTable(base?.table, result),
+					: mergeTable(latest?.table, result),
 				updatedAt: new Date().toISOString(),
 			};
 			writeStore(target, data);
 			store = data;
-			installMatcher(data.table);
+			installMatcher(data.enabled ? data.table : undefined);
 			activate();
 
 			const count = Object.keys(result.entries).length;
 			const failed = result.failed.length;
-			currentUi?.notify?.(
-				`팁을 ${options.language}로 번역했습니다 (${count}개${failed > 0 ? `, 실패 ${failed}개` : ""})`,
+			notifyOn(
+				currentUi,
+				`팁을 ${language}로 번역했습니다 (${count}개${failed > 0 ? `, 실패 ${failed}개` : ""})`,
 				"info",
 			);
 			requestRender();
 		} catch (error) {
-			currentUi?.notify?.(`팁 번역 실패: ${errorMessage(error)}. 기존 번역을 유지합니다.`, "error");
+			notifyOn(currentUi, `팁 번역 실패: ${errorMessage(error)}. 기존 번역을 유지합니다.`, "error");
 		} finally {
-			setStatus(undefined);
-			releaseLock(target);
+			setStatus(undefined, currentUi);
+			releaseLock(target, token);
 		}
 	};
 
@@ -451,7 +561,7 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 		if (!model) return;
 		const language = await pickLanguage();
 		if (!language) return;
-		void translate(ctx, {
+		await translate(ctx, {
 			language,
 			model: { provider: model.provider, id: model.id },
 			targets: templates,
@@ -472,8 +582,33 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 			model,
 			targets: templates,
 			includeFixed: true,
-			base,
+			preferFreshModel: false,
 			replaceEntries: true,
+			requireModelMatch: true,
+			adoptExisting: false,
+		});
+	};
+
+	const handleChangedCatalog = async (ctx: Context, path: string): Promise<void> => {
+		const accepted = await ui?.confirm?.(
+			"팁이 바뀌었습니다",
+			"omo 업데이트로 팁이 바뀌었습니다. 새 팁을 번역할까요?",
+		);
+		if (!accepted) {
+			updateStoreUnderLock(
+				path,
+				(fresh) => ({ ...fresh, declinedHash: hash, updatedAt: new Date().toISOString() }),
+				ctx.ui ?? ui,
+			);
+			return;
+		}
+		await translate(ctx, {
+			language: store?.language ?? "한국어",
+			targets: (fresh) =>
+				diffTemplates(templates, fresh?.table ?? { prefix: PREFIX_EN, pointer: POINTER_EN, entries: {} }),
+			includeFixed: false,
+			useFreshSettings: true,
+			preferFreshModel: true,
 		});
 	};
 
@@ -500,7 +635,7 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 				if (existed) {
 					notifySeamOnce(`tips-translate: 저장된 번역을 읽지 못했습니다 (${read.error}). 팁은 영어로 표시됩니다.`);
 				} else if (ctx.mode === "tui") {
-					await startFirstRun(ctx);
+					runBackground(() => startFirstRun(ctx));
 				}
 				return;
 			}
@@ -518,44 +653,7 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 			if (store.sourceHash === hash || store.declinedHash === hash) return;
 			if (ctx.mode !== "tui" || typeof ui?.confirm !== "function") return;
 
-			const accepted = await ui.confirm(
-				"팁이 바뀌었습니다",
-				"omo 업데이트로 팁이 바뀌었습니다. 새 팁을 번역할까요?",
-			);
-			if (!accepted) {
-				const declined: StoreData = {
-					...store,
-					declinedHash: hash,
-					updatedAt: new Date().toISOString(),
-				};
-				try {
-					writeStore(path, declined);
-					store = declined;
-				} catch (error) {
-					notify(`변경 사항을 저장하지 못했습니다: ${errorMessage(error)}`, "error");
-				}
-				return;
-			}
-
-			const targets = diffTemplates(templates, store.table);
-			if (targets.length === 0) {
-				const updated: StoreData = { ...store, sourceHash: hash, omoVersion: version, updatedAt: new Date().toISOString() };
-				try {
-					writeStore(path, updated);
-					store = updated;
-				} catch (error) {
-					notify(`변경 사항을 저장하지 못했습니다: ${errorMessage(error)}`, "error");
-				}
-				return;
-			}
-			const base = store;
-			void translate(ctx, {
-				language: store.language,
-				model: store.model,
-				targets,
-				includeFixed: false,
-				base,
-			});
+			runBackground(() => handleChangedCatalog(ctx, path));
 		});
 
 		pi.on("session_shutdown", () => {
@@ -615,18 +713,10 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 				if (choice === "모델 바꾸기") {
 					const model = await pickModel(ctx, store.model);
 					if (!model) return;
-					const updated: StoreData = {
+					await runCommandTranslation(ctx, store.language, {
 						...store,
 						model: { provider: model.provider, id: model.id },
-						updatedAt: new Date().toISOString(),
-					};
-					try {
-						writeStore(storePath(dir), updated);
-						store = updated;
-						notify(`번역 모델을 ${modelLabel(model)}로 바꿨습니다.`, "info");
-					} catch (error) {
-						notify(`모델 설정을 저장하지 못했습니다: ${errorMessage(error)}`, "error");
-					}
+					});
 					return;
 				}
 
@@ -637,22 +727,21 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 
 				if (choice === "끄기" || choice === "켜기") {
 					const enabled = !store.enabled;
-					const updated: StoreData = { ...store, enabled, updatedAt: new Date().toISOString() };
-					try {
-						writeStore(storePath(dir), updated);
-						store = updated;
-						if (enabled) {
-							installMatcher(store.table);
-							activate();
-						} else {
-							activeMatcher = undefined;
-							if (shared[IMPL] === impl) shared[IMPL] = undefined;
-						}
-						requestRender();
-						notify(enabled ? "팁 번역을 켰습니다." : "팁 번역을 껐습니다. 팁은 영어로 표시됩니다.", "info");
-					} catch (error) {
-						notify(`설정을 저장하지 못했습니다: ${errorMessage(error)}`, "error");
+					const updated = updateStoreUnderLock(
+						storePath(dir),
+						(fresh) => ({ ...fresh, enabled, updatedAt: new Date().toISOString() }),
+						ctx.ui ?? ui,
+					);
+					if (!updated) return;
+					if (enabled) {
+						installMatcher(updated.table);
+						activate();
+					} else {
+						activeMatcher = undefined;
+						if (shared[IMPL] === impl) shared[IMPL] = undefined;
 					}
+					requestRender();
+					notify(enabled ? "팁 번역을 켰습니다." : "팁 번역을 껐습니다. 팁은 영어로 표시됩니다.", "info");
 					return;
 				}
 
