@@ -287,6 +287,46 @@ export function findCatalogFiles(runtimeRoot: string): string[] {
 	return listJsFiles(catalogDir).filter((file) => /-tips\.js$/.test(file));
 }
 
+const REASONING_LEVEL_ID = "reasoning-level-key";
+
+function extractReasoningLevelTemplate(source: string): TipTemplate | undefined {
+	const marker = source.indexOf(REASONING_LEVEL_ID);
+	if (marker === -1) return undefined;
+	const literalStart = source.indexOf("`Tip: ", marker);
+	if (literalStart === -1) return undefined;
+	const literal = parseLiteral(source, literalStart);
+	if (!literal || literal.explicitSlot) return undefined;
+	if (!literal.value.startsWith(PREFIX_EN)) return undefined;
+	const en = literal.value.slice(PREFIX_EN.length).replace(NORMALIZE, " ").trim();
+	if (!en) return undefined;
+	return { id: REASONING_LEVEL_ID, en, slots: literal.slots };
+}
+
+function findReasoningLevelSource(runtimeRoot: string): string | undefined {
+	const chunkDir = resolve(runtimeRoot, "dist", "bundle", "chunks");
+	for (const file of listJsFiles(chunkDir)) {
+		try {
+			const source = readFileSync(file, "utf8");
+			if (source.includes(REASONING_LEVEL_ID)) return source;
+		} catch {
+			// Try the next candidate.
+		}
+	}
+	const noticeFile = resolve(
+		runtimeRoot,
+		"dist",
+		"modes",
+		"interactive",
+		"tips",
+		"reasoning-level-notice.js",
+	);
+	try {
+		return readFileSync(noticeFile, "utf8");
+	} catch {
+		return undefined;
+	}
+}
+
 export function loadTemplates(runtimeRoot: string): { templates: TipTemplate[]; files: string[] } {
 	const files = findCatalogFiles(runtimeRoot);
 	const seen = new Set<string>();
@@ -302,6 +342,15 @@ export function loadTemplates(runtimeRoot: string): { templates: TipTemplate[]; 
 			if (seen.has(template.id)) continue;
 			seen.add(template.id);
 			templates.push(template);
+		}
+	}
+
+	if (!seen.has(REASONING_LEVEL_ID)) {
+		const noticeSource = findReasoningLevelSource(runtimeRoot);
+		const notice = noticeSource && extractReasoningLevelTemplate(noticeSource);
+		if (notice) {
+			seen.add(notice.id);
+			templates.push(notice);
 		}
 	}
 	return { templates, files };

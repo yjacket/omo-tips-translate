@@ -162,6 +162,54 @@ describe("findCatalogFiles", () => {
 	});
 });
 
+describe("loadTemplates reasoning-level notice", () => {
+	test("reads the one-time notice from a bundle chunk", () => {
+		const root = mkdtempSync(join(tmpdir(), "tips-extract-"));
+		try {
+			const chunks = join(root, "dist", "bundle", "chunks");
+			mkdirSync(chunks, { recursive: true });
+			writeFileSync(
+				join(chunks, "notice.js"),
+				'function f(){let key=options.keys("app.thinking.cycle");if(key)return{tipId:"reasoning-level-key",line:`Tip: ${key} changes the reasoning level`}}',
+			);
+			expect(loadTemplates(root).templates).toEqual([
+				{ id: "reasoning-level-key", en: "{0} changes the reasoning level", slots: 1 },
+			]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("falls back to dist/modes/interactive/tips/reasoning-level-notice.js", () => {
+		const root = mkdtempSync(join(tmpdir(), "tips-extract-"));
+		try {
+			const tips = join(root, "dist", "modes", "interactive", "tips");
+			mkdirSync(tips, { recursive: true });
+			writeFileSync(
+				join(tips, "reasoning-level-notice.js"),
+				'export const REASONING_LEVEL_TIP_ID = "reasoning-level-key";\nexport function f(key) { return `Tip: ${key} changes the reasoning level`; }\n',
+			);
+			expect(loadTemplates(root).templates).toEqual([
+				{ id: "reasoning-level-key", en: "{0} changes the reasoning level", slots: 1 },
+			]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("omits the notice when the runtime has no such literal", () => {
+		const root = mkdtempSync(join(tmpdir(), "tips-extract-"));
+		try {
+			const chunks = join(root, "dist", "bundle", "chunks");
+			mkdirSync(chunks, { recursive: true });
+			writeFileSync(join(chunks, "a.js"), 'var CLI_TIPS=[{id:"a",render:()=>"a"}];');
+			expect(loadTemplates(root).templates).toEqual([{ id: "a", en: "a", slots: 0 }]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("sourceHash", () => {
 	test("is order independent, id/en sensitive, and stable", () => {
 		const a = { id: "a", en: "one", slots: 0 };
@@ -198,6 +246,11 @@ describe(
 			expect(stopChord).toEqual({
 				id: "computer.stop-chord",
 				en: "Press {0} at any moment to stop computer input. It stays stopped until you run /computer resume; the agent cannot resume it.",
+				slots: 1,
+			});
+			expect(result.templates.find((t) => t.id === "reasoning-level-key")).toEqual({
+				id: "reasoning-level-key",
+				en: "{0} changes the reasoning level",
 				slots: 1,
 			});
 		});
