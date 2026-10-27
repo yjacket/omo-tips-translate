@@ -3,6 +3,7 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readFileSync,
 	readdirSync,
 	rmSync,
 	statSync,
@@ -12,6 +13,8 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	POINTER_EN,
+	POINTER_EN_LEGACY,
+	POINTER_FORMS,
 	PREFIX_EN,
 	extractTemplates,
 	findCatalogFiles,
@@ -60,9 +63,28 @@ if (runtimeAvailable) {
 test("exports the exact runtime prefix and pointer strings", () => {
 	expect(PREFIX_EN).toBe("Tip: ");
 	expect(POINTER_EN).toBe(
+		"↳ Want the full story on any tip? Ask about it: the give-me-tips skill has the tour.",
+	);
+	expect(POINTER_EN_LEGACY).toBe(
 		"↳ Want the full story on any tip? Ask about it — the give-me-tips skill has the tour.",
 	);
+	expect(POINTER_FORMS).toEqual([POINTER_EN, POINTER_EN_LEGACY]);
 });
+
+if (runtimeAvailable && RUNTIME_ROOT) {
+	test("the real runtime prints one of the known pointer forms", () => {
+		const chunkDir = join(RUNTIME_ROOT, "dist", "bundle", "chunks");
+		const chunks = existsSync(chunkDir) ? readdirSync(chunkDir).map((name) => join(chunkDir, name)) : [];
+		const sources = [join(RUNTIME_ROOT, "dist", "modes", "interactive", "tips", "startup-tip.js"), ...chunks]
+			.filter((file) => file.endsWith(".js") && existsSync(file));
+		// Bundled chunks escape the arrow as \u21B3, so compare the text after it.
+		const found = sources.some((file) => {
+			const text = readFileSync(file, "utf8");
+			return POINTER_FORMS.some((pointer) => text.includes(pointer.slice(2)));
+		});
+		expect(found).toBe(true);
+	});
+}
 
 describe("extractTemplates", () => {
 	test("reads minified chunk-style definitions", () => {

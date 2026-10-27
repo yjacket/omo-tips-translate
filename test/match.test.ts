@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { createMatcher, placeholders, type Table } from "../src/match";
 
 const POINTER_EN =
+  "↳ Want the full story on any tip? Ask about it: the give-me-tips skill has the tour.";
+const POINTER_EN_LEGACY =
   "↳ Want the full story on any tip? Ask about it — the give-me-tips skill has the tour.";
 const POINTER_TR = "↳ 팁의 전체 이야기가 궁금한가요? 물어보세요 — give-me-tips 스킬에 안내가 있습니다.";
 
@@ -39,6 +41,11 @@ describe("createMatcher", () => {
   test("translates the pointer line", () => {
     const matcher = createMatcher(table({}));
     expect(matcher.translateText(POINTER_EN)).toBe(POINTER_TR);
+  });
+
+  test("translates the pre-5.1.45 em dash pointer line", () => {
+    const matcher = createMatcher(table({}));
+    expect(matcher.translateText(POINTER_EN_LEGACY)).toBe(POINTER_TR);
   });
 
   test("translates a two-line tip plus pointer inside ANSI codes", () => {

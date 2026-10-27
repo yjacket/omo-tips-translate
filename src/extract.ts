@@ -5,7 +5,11 @@ import { resolve } from "node:path";
 export type TipTemplate = { id: string; en: string; slots: number };
 
 export const POINTER_EN =
+	"↳ Want the full story on any tip? Ask about it: the give-me-tips skill has the tour.";
+// omo before 5.1.45 printed an em dash where the current pointer has a colon.
+export const POINTER_EN_LEGACY =
 	"↳ Want the full story on any tip? Ask about it — the give-me-tips skill has the tour.";
+export const POINTER_FORMS: readonly string[] = [POINTER_EN, POINTER_EN_LEGACY];
 export const PREFIX_EN = "Tip: ";
 
 const NORMALIZE = /\s*\n\s*/g;

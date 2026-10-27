@@ -1,4 +1,4 @@
-import { POINTER_EN, PREFIX_EN } from "./extract";
+import { POINTER_FORMS, PREFIX_EN } from "./extract";
 
 export type Entry = { en: string; tr: string };
 export type Table = { prefix: string; pointer: string; entries: Record<string, Entry> };
@@ -62,7 +62,7 @@ export function createMatcher(table: Table): Matcher {
   }
 
   const translateLine = (line: string): string => {
-    if (line === POINTER_EN) return table.pointer;
+    if (POINTER_FORMS.includes(line)) return table.pointer;
 
     if (line.startsWith(PREFIX_EN)) {
       const body = line.slice(PREFIX_EN.length);
