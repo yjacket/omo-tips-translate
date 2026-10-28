@@ -12,6 +12,7 @@ import { existsSync } from "node:fs";
 
 import {
 	POINTER_EN,
+	POINTER_FORMS,
 	PREFIX_EN,
 	loadTemplates,
 	sourceHash,
@@ -104,7 +105,7 @@ function plainText(text: string): string {
 
 function isTipText(text: string): boolean {
 	const plain = plainText(text);
-	if (plain.includes(POINTER_EN)) return true;
+	if (POINTER_FORMS.some((pointer) => plain.includes(pointer))) return true;
 	return plain.split("\n").some((line) => line.startsWith(PREFIX_EN));
 }
 
