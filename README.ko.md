@@ -15,27 +15,25 @@ OMO(senpi)의 TUI 팁을 고른 언어로 보여 주는 확장입니다. 시작�
 
 ## 설치
 
-Windows PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/yjacket/omo-tips-translate/main/install.ps1 | iex
-```
-
-macOS / Linux:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/yjacket/omo-tips-translate/main/install.sh | sh
-```
-
-두 스크립트 모두 다음을 실행합니다.
-
 ```sh
 omo install git:github.com/yjacket/omo-tips-translate
 ```
 
 omo가 저장소를 `~/.omo/agent/git/github.com/yjacket/omo-tips-translate`에 클론하고 `~/.omo/agent/settings.json`의 `packages`에 등록합니다. 실행 중인 세션에서 `/reload`를 입력하세요.
 
-**업데이트:** `omo update --extensions`(설치된 패키지 전부) 또는 `omo update git:github.com/yjacket/omo-tips-translate`를 실행한 뒤 `/reload`를 입력하세요.
+편의 스크립트도 있습니다. 같은 명령을 실행합니다.
+
+```powershell
+# Windows PowerShell
+irm https://raw.githubusercontent.com/yjacket/omo-tips-translate/main/install.ps1 | iex
+```
+
+```sh
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/yjacket/omo-tips-translate/main/install.sh | sh
+```
+
+**업데이트:** `omo update --extensions`로 git 설치된 확장 전체를 갱신합니다. 이것만 갱신하려면 `omo update --extension git:github.com/yjacket/omo-tips-translate`. 그 뒤 실행 중인 세션에서 `/reload`를 입력하세요.
 
 **제거:** `omo remove git:github.com/yjacket/omo-tips-translate`를 실행하고 `/reload` 하거나 omo를 다시 시작합니다. 팁이 다시 영어로 보입니다. 저장된 번역까지 지우려면 `~/.omo/agent/omo-tips-translate.json`을 삭제하세요.
 
@@ -95,11 +93,19 @@ print, JSON, RPC 모드에서는 질문하지 않고 저장된 표를 그대로 
 
 ## 개발
 
+변경은 PR로 반영합니다. 워크트리를 만들어 작업하고 PR을 열어 주세요. `test` 체크를 통과해야 머지할 수 있습니다.
+
+로컬에서 테스트 실행:
+
 ```sh
 bun test
 ```
 
-테스트는 순수 모듈과 확장 연결부를 함께 대상으로 하는 `bun:test` 단위 테스트입니다. 원문 추출과 해시, 플레이스홀더와 ANSI 코드가 섞인 줄 매칭, 원자적 저장과 세션 간 잠금, 배치 번역 검증, 그리고 첫 실행·원문 변경·명령·리로드·접점 없음·저장 파일 손상 경로를 다룹니다. 확장 테스트는 가짜 senpi/pi-tui 모듈과 새 임포트만 쓰고 실제 OMO 세션은 쓰지 않으며 sleep도 쓰지 않습니다. 격리된 라이브 리플레이(`bun qa/live-replay.mjs`)는 임시 에이전트 디렉터리로 실제 TUI를 구동합니다. 자세한 방법은 [CLAUDE.md](CLAUDE.md)에 있습니다. Bun >= 1.4가 필요합니다.
+테스트는 순수 모듈과 확장 연결부를 함께 대상으로 하는 `bun:test` 단위 테스트입니다. 원문 추출과 해시, 플레이스홀더와 ANSI 코드가 섞인 줄 매칭, 원자적 저장과 세션 간 잠금, 배치 번역 검증, 그리고 첫 실행·원문 변경·명령·리로드·접점 없음·저장 파일 손상 경로를 다룹니다. 확장 테스트는 가짜 senpi/pi-tui 모듈과 새 임포트만 쓰고 실제 OMO 세션은 쓰지 않으며 sleep도 쓰지 않습니다.
+
+격리된 라이브 리플레이(`bun qa/live-replay.mjs`)는 임시 에이전트 디렉터리로 실제 TUI를 구동합니다. 자세한 방법은 [CLAUDE.md](CLAUDE.md)에 있습니다. 라이브 테스트는 `~/.omo`, 실제 health 데몬, inbox 서버, HKCU Run 값을 건드리지 않습니다. 임시 HOME/USERPROFILE/APPDATA/LOCALAPPDATA를 씁니다.
+
+Bun >= 1.4가 필요합니다.
 
 ## 라이선스
 

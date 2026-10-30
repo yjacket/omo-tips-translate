@@ -12,7 +12,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 bun test
 bun test -t "<name substring>"
 bun test test/extract.test.ts
-omo install <path-to-this-clone>   # loads the working tree; /reload picks up edits
+omo install <path-to-this-clone>   # dev only: loads the working tree; /reload picks up edits
+                                   # switch back to git install afterwards
 ```
 
 It ships as an omo package: `package.json` `pi.extensions` names `extension/tips-translate.ts`, and users install it with `omo install git:github.com/yjacket/omo-tips-translate`. The installers run that same command. The package requires Bun >= 1.4.
