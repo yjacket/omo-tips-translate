@@ -15,27 +15,25 @@ The first run takes a few moments to translate the whole catalog in the backgrou
 
 ## Install
 
-Windows PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/yjacket/omo-tips-translate/main/install.ps1 | iex
-```
-
-macOS / Linux:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/yjacket/omo-tips-translate/main/install.sh | sh
-```
-
-Both run:
-
 ```sh
 omo install git:github.com/yjacket/omo-tips-translate
 ```
 
 omo clones the repository into `~/.omo/agent/git/github.com/yjacket/omo-tips-translate` and adds it to `packages` in `~/.omo/agent/settings.json`. Type `/reload` in running sessions.
 
-**Update:** `omo update --extensions` (every installed package) or `omo update git:github.com/yjacket/omo-tips-translate`, then `/reload`.
+Or use the convenience scripts, which run the same command:
+
+```powershell
+# Windows PowerShell
+irm https://raw.githubusercontent.com/yjacket/omo-tips-translate/main/install.ps1 | iex
+```
+
+```sh
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/yjacket/omo-tips-translate/main/install.sh | sh
+```
+
+**Update:** `omo update --extensions` pulls the latest for every git-installed extension. To update just this one: `omo update --extension git:github.com/yjacket/omo-tips-translate`. Then `/reload` in running sessions.
 
 **Uninstall:** `omo remove git:github.com/yjacket/omo-tips-translate`, then `/reload` or restart omo. The tips render in English again. To delete the saved translations too, remove `~/.omo/agent/omo-tips-translate.json`.
 
@@ -95,11 +93,19 @@ The extension wraps `Text.prototype.render` from `@earendil-works/pi-tui`, the p
 
 ## Development
 
+Changes land through a PR. Create a worktree, work there, and open a PR. The `test` check is required to pass before merging.
+
+Run tests locally:
+
 ```sh
 bun test
 ```
 
-The tests are `bun:test` unit tests for the pure modules and the extension wiring. They cover catalog extraction and hashing, matching with placeholders and ANSI codes, the atomic store and cross-session lock, batched translation validation, and the extension's first-run, changed-hash, command, reload, missing-seam, and corrupt-store paths. Extension tests use fake senpi and pi-tui modules and fresh imports, never a live OMO session, and no test sleeps. An isolated live replay (`bun qa/live-replay.mjs`) drives a real TUI against a temporary agent directory; see [CLAUDE.md](CLAUDE.md). The package requires Bun >= 1.4.
+The tests are `bun:test` unit tests for the pure modules and the extension wiring. They cover catalog extraction and hashing, matching with placeholders and ANSI codes, the atomic store and cross-session lock, batched translation validation, and the extension's first-run, changed-hash, command, reload, missing-seam, and corrupt-store paths. Extension tests use fake senpi and pi-tui modules and fresh imports, never a live OMO session, and no test sleeps.
+
+An isolated live replay (`bun qa/live-replay.mjs`) drives a real TUI against a temporary agent directory; see [CLAUDE.md](CLAUDE.md). Live tests never touch `~/.omo`, the real health daemon, the inbox server, or HKCU Run values. They use a temp HOME/USERPROFILE/APPDATA/LOCALAPPDATA under a throwaway directory.
+
+The package requires Bun >= 1.4.
 
 ## License
 
