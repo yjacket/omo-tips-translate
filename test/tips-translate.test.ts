@@ -398,7 +398,11 @@ describe("tips-translate session flow", () => {
 
 	test("declining a changed catalog stores the hash and never asks again", async () => {
 		const host = makeHost();
-		makeStore({ agentDir: host.agentDir, source: "older-hash" });
+		makeStore({
+			agentDir: host.agentDir,
+			source: "older-hash",
+			entries: { hello: { en: "Hello world", tr: "번역 A" } },
+		});
 		host.ui.confirmQueue.push(false);
 		const api = await load(host);
 		await api.fire("session_start");
@@ -410,6 +414,28 @@ describe("tips-translate session flow", () => {
 
 		await api.fire("session_start");
 		expect(host.ui.confirms.length).toBe(1);
+	});
+
+	test("a catalog that only dropped tips adopts the new hash without asking", async () => {
+		const host = makeHost();
+		makeStore({
+			agentDir: host.agentDir,
+			source: "older-hash",
+			entries: {
+				hello: { en: "Hello world", tr: "번역 A" },
+				key: { en: "Press {0} now", tr: "번역 B {0}" },
+				gone: { en: "A tip omo removed", tr: "번역 C" },
+			},
+		});
+		await load(host).then((api) => api.fire("session_start"));
+
+		expect(host.ui.confirms.length).toBe(0);
+		const saved = readStore(storePath(host.agentDir)).data!;
+		expect(saved.sourceHash).toBe(catalogHash);
+		expect(saved.declinedHash).toBeUndefined();
+		const tip = new host.Text("Tip: Hello world");
+		tip.render(120);
+		expect(tip.text).toBe("«한국어» Tip: 번역 A");
 	});
 
 	test("an unchanged catalog does not prompt", async () => {
