@@ -46,7 +46,7 @@ With no saved translation, the extension asks two questions in the TUI:
 
 The answer is saved, and translation runs in the background. Failures are reported but do not block the session; tips that could not be translated stay in English.
 
-After an OMO update changes the tip catalog, the extension asks once whether to translate the new tips. Yes translates only the changed and new ones and keeps the rest. No remembers that catalog hash, so the same question does not come back. Tips that did not change keep their existing translations either way.
+After an OMO update changes the tip catalog, the extension asks once whether to translate the new tips. If the update only removed tips, there is nothing to translate and it does not ask. Yes translates only the changed and new ones and keeps the rest. No remembers that catalog hash, so the same question does not come back. Tips that did not change keep their existing translations either way.
 
 In print, JSON, and RPC modes there are no prompts. The saved table is used as is.
 

@@ -591,6 +591,15 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 	};
 
 	const handleChangedCatalog = async (ctx: Context, path: string): Promise<void> => {
+		// A catalog that only dropped tips (omo 5.1.54 removed two) has nothing new to translate: adopt its hash quietly.
+		if (store && diffTemplates(templates, store.table).length === 0) {
+			updateStoreUnderLock(
+				path,
+				(fresh) => ({ ...fresh, sourceHash: hash, omoVersion: version, updatedAt: new Date().toISOString() }),
+				ctx.ui ?? ui,
+			);
+			return;
+		}
 		const accepted = await ui?.confirm?.(
 			"팁이 바뀌었습니다",
 			"omo 업데이트로 팁이 바뀌었습니다. 새 팁을 번역할까요?",
