@@ -7,8 +7,18 @@
 //
 // Every seam is feature-detected. A missing Text class, catalog, store, or model
 // leaves the display in English and reports at most one warning per session.
+//
+// Translation follows the routing `quick` category unless the user pinned a
+// model: the chain is resolved at translation time through the installed
+// omo-routing extension (the same layering /routing shows: builtin chain, then
+// base, [native] and the active profile of ~/.omo/omo.jsonc), and each model is
+// tried in order. When the chain cannot be read, the session model and then the
+// last translating model stand in.
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import {
 	POINTER_EN,
@@ -26,9 +36,10 @@ import {
 	releaseLock,
 	storePath,
 	writeStore,
+	type ModelError,
 	type StoreData,
 } from "../src/store";
-import { translateTemplates } from "../src/translate";
+import { cleanError, translateTemplates, type Candidate } from "../src/translate";
 
 const HOOK = Symbol.for("omo.tips-translate.text-hook.v1");
 const IMPL = Symbol.for("omo.tips-translate.impl.v1");
@@ -46,7 +57,10 @@ const LANGUAGES = [
 	"Русский",
 ];
 const DIRECT_INPUT = "직접 입력";
+const QUICK = "quick (자동)";
 const COMMAND = "tips-translate";
+// Reasoning suffixes omo-routing appends to chain specs ("provider/model:low").
+const EFFORTS = new Set(["off", "none", "minimal", "low", "medium", "high", "xhigh", "max", "auto"]);
 
 type Ui = {
 	select?: (title: string, options: string[]) => Promise<string | undefined>;
@@ -59,6 +73,8 @@ type Ui = {
 
 type ModelRef = { provider: string; id: string };
 type Model = ModelRef & Record<string, unknown>;
+// Where translation models come from: the quick chain, or one model on purpose.
+type Source = { kind: "quick" } | { kind: "pinned"; model: ModelRef };
 
 type Registry = {
 	getAvailable?: () => Model[];
@@ -68,11 +84,16 @@ type Registry = {
 		model: Model,
 		context: { systemPrompt?: string; messages: unknown[] },
 		options: Record<string, unknown>,
-	) => Promise<{ content?: Array<{ type?: string; text?: string }>; stopReason?: string }>;
+	) => Promise<{
+		content?: Array<{ type?: string; text?: string }>;
+		stopReason?: string;
+		errorMessage?: string;
+	}>;
 };
 
 type Context = {
 	mode?: string;
+	cwd?: string;
 	agentDir?: string;
 	model?: Model;
 	modelRegistry?: Registry;
@@ -115,6 +136,26 @@ function modelLabel(model: ModelRef): string {
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function specModel(spec: unknown): ModelRef | undefined {
+	if (typeof spec !== "string") return undefined;
+	const slash = spec.indexOf("/");
+	if (slash <= 0) return undefined;
+	let id = spec.slice(slash + 1).trim();
+	const colon = id.lastIndexOf(":");
+	if (colon > 0 && EFFORTS.has(id.slice(colon + 1))) id = id.slice(0, colon);
+	return id.length > 0 ? { provider: spec.slice(0, slash), id } : undefined;
+}
+
+function sourceOf(data: StoreData | undefined): Source {
+	return data?.pinned ? { kind: "pinned", model: data.model } : { kind: "quick" };
+}
+
+function formatErrors(errors: ModelError[]): string {
+	const shown = errors.slice(0, 3).map((item) => `${item.model}: ${item.error}`);
+	if (errors.length > 3) shown.push(`외 ${errors.length - 3}개`);
+	return shown.join(" · ");
 }
 
 function installHook(TextClass: unknown): string | undefined {
@@ -320,6 +361,77 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 		}
 	};
 
+	// The effective quick chain, read with omo-routing's own resolution so it
+	// matches /routing. `problem` says why the chain is unusable.
+	const quickChain = async (): Promise<{ models: ModelRef[]; problem?: string }> => {
+		const file = join(agentDir, "git", "github.com", "yjacket", "omo-routing", "extension", "routing.ts");
+		if (!existsSync(file)) return { models: [], problem: "omo-routing이 설치되어 있지 않습니다" };
+		try {
+			type Fn = (...args: unknown[]) => any;
+			const routing = (await import(pathToFileURL(file).href)) as Record<string, unknown>;
+			const parseJsonc = routing.parseJsonc as Fn;
+			const applyProfile = routing.applyProfile as Fn;
+			const resolveProfileName = routing.resolveProfileName as Fn;
+			const loadBuiltinRouting = routing.loadBuiltinRouting as Fn;
+			const resolveRouting = routing.resolveRouting as Fn;
+			if ([parseJsonc, applyProfile, resolveProfileName, loadBuiltinRouting, resolveRouting].some((fn) => typeof fn !== "function")) {
+				return { models: [], problem: "omo-routing에서 체인 해석 함수를 찾지 못했습니다" };
+			}
+			const env = process.env;
+			// The same home OMO itself reads omo.jsonc from.
+			const home = env.HOME ?? env.USERPROFILE ?? homedir();
+			const config = ["omo.jsonc", "omo.json"].map((name) => join(home, ".omo", name)).find((path) => existsSync(path));
+			const raw = config ? parseJsonc(readFileSync(config, "utf8")) : {};
+			const resolved = resolveRouting(applyProfile(raw, resolveProfileName(env)).config, loadBuiltinRouting(env));
+			if (resolved?.sources?.categories?.quick === "disabled") return { models: [], problem: "quick 카테고리가 꺼져 있습니다" };
+			const specs: unknown = resolved?.config?.categories?.quick?.models;
+			const models: ModelRef[] = [];
+			for (const spec of Array.isArray(specs) ? specs : []) {
+				const model = specModel(spec);
+				if (model && !models.some((known) => modelLabel(known) === modelLabel(model))) models.push(model);
+			}
+			return models.length > 0 ? { models } : { models, problem: "quick 체인이 비어 있습니다" };
+		} catch (error) {
+			return { models: [], problem: `quick 체인을 읽지 못했습니다: ${cleanError(error)}` };
+		}
+	};
+
+	// Models to try in order. `notes` carries why the quick chain fell back.
+	const candidatesFor = async (
+		ctx: Context,
+		source: Source,
+		last: ModelRef | undefined,
+	): Promise<{ models: Candidate[]; refs: Map<string, ModelRef>; notes: ModelError[] }> => {
+		const refs = new Map<string, ModelRef>();
+		const notes: ModelError[] = [];
+		const add = (model: ModelRef | undefined) => {
+			if (!model || typeof model.provider !== "string" || typeof model.id !== "string") return;
+			const label = modelLabel(model);
+			if (!refs.has(label)) refs.set(label, { provider: model.provider, id: model.id });
+		};
+		if (source.kind === "pinned") {
+			add(source.model);
+		} else {
+			const chain = await quickChain();
+			// Like a task spawn, quick skips rungs this session has no sign-in for.
+			const registry = ctx.modelRegistry;
+			const connected = chain.models.filter((model) => {
+				const found = registry?.find?.(model.provider, model.id);
+				return found !== undefined && registry?.hasConfiguredAuth?.(found) !== false;
+			});
+			for (const model of connected) add(model);
+			const problem =
+				chain.problem ?? (connected.length === 0 ? "quick 체인에 연결된 모델이 없습니다" : undefined);
+			if (problem !== undefined) {
+				notes.push({ model: "quick", error: problem });
+				add(ctx.model);
+				add(last);
+			}
+		}
+		const models = [...refs].map(([label, ref]) => ({ label, complete: completeFor(ctx, ref) }));
+		return { models, refs, notes };
+	};
+
 	const completeFor = (ctx: Context, model: ModelRef) => {
 		return async (system: string, user: string): Promise<string> => {
 			const registry = ctx.modelRegistry;
@@ -343,9 +455,12 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 						},
 					],
 				},
-				{ maxTokens: 16000 },
+				// Session-bound providers (anthropic-subscription) refuse a request
+				// without the session's absolute cwd.
+				{ maxTokens: 16000, ...(typeof ctx.cwd === "string" && isAbsolute(ctx.cwd) ? { cwd: ctx.cwd } : {}) },
 			);
 			if (response?.stopReason === "aborted") throw new Error("번역이 중단되었습니다");
+			if (response?.stopReason === "error") throw new Error(response.errorMessage || "모델 오류");
 			const text = (response?.content ?? [])
 				.filter((part): part is { type: "text"; text: string } => part.type === "text" && typeof part.text === "string")
 				.map((part) => part.text)
@@ -387,13 +502,12 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 		ctx: Context,
 		options: {
 			language: string;
-			model?: ModelRef;
+			// Omitted: the saved store's source (quick unless pinned).
+			source?: Source;
 			targets: TipTemplate[] | ((fresh: StoreData | undefined) => TipTemplate[]);
 			includeFixed: boolean;
 			useFreshSettings?: boolean;
-			preferFreshModel?: boolean;
 			replaceEntries?: boolean;
-			requireModelMatch?: boolean;
 			adoptExisting?: boolean;
 		},
 	): Promise<void> => {
@@ -412,20 +526,12 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 			if (fresh) store = fresh;
 
 			const language = options.useFreshSettings && fresh ? fresh.language : options.language;
-			const requestedModel = options.model;
-			const model =
-				(options.preferFreshModel && fresh ? fresh.model : requestedModel) ?? fresh?.model ?? store?.model;
-			const sameModel =
-				fresh !== undefined &&
-				requestedModel !== undefined &&
-				fresh.model.provider === requestedModel.provider &&
-				fresh.model.id === requestedModel.id;
+			const source = options.source ?? sourceOf(fresh ?? store);
 			if (
 				options.adoptExisting !== false &&
 				fresh !== undefined &&
 				fresh.sourceHash === hash &&
-				fresh.language === language &&
-				(!options.requireModelMatch || sameModel)
+				fresh.language === language
 			) {
 				installMatcher(fresh.enabled ? fresh.table : undefined);
 				activate();
@@ -455,8 +561,10 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 				return;
 			}
 
-			if (!model) {
-				notifyOn(currentUi, "번역에 사용할 모델이 없습니다. 팁은 영어로 표시됩니다.", "warning");
+			const chain = await candidatesFor(ctx, source, (fresh ?? store)?.model);
+			if (chain.models.length === 0) {
+				const why = formatErrors(chain.notes);
+				notifyOn(currentUi, `번역에 사용할 모델이 없습니다${why ? ` (${why})` : ""}. 팁은 영어로 표시됩니다.`, "warning");
 				return;
 			}
 
@@ -465,7 +573,7 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 			const result = await translateTemplates({
 				templates: targets,
 				language,
-				complete: completeFor(ctx, model),
+				models: chain.models,
 				includeFixed: options.includeFixed,
 				onProgress: (nextDone, nextTotal) => {
 					done = nextDone;
@@ -474,8 +582,18 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 				},
 			});
 
-			if (Object.keys(result.entries).length === 0) {
-				notifyOn(currentUi, "팁을 번역하지 못했습니다. 기존 번역을 유지하고 영어로 표시합니다.", "error");
+			const errors = [...chain.notes, ...result.errors];
+			const translatedBy = chain.refs.get(result.models.at(-1) ?? "");
+			if (Object.keys(result.entries).length === 0 || !translatedBy) {
+				const why = formatErrors(errors) || "쓸 수 있는 번역이 없었습니다";
+				notifyOn(currentUi, `팁을 번역하지 못했습니다 (${why}). 기존 번역을 유지하고 영어로 표시합니다.`, "error");
+				// Keep the reasons for /tips-translate 상태; the table stays as it was.
+				const saved = readStore(target).data;
+				if (saved && errors.length > 0) {
+					const failed: StoreData = { ...saved, lastErrors: errors, updatedAt: new Date().toISOString() };
+					writeStore(target, failed);
+					store = failed;
+				}
 				return;
 			}
 
@@ -484,7 +602,9 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 				version: 1,
 				omoVersion: version,
 				sourceHash: hash,
-				model: { provider: model.provider, id: model.id },
+				model: translatedBy,
+				...(source.kind === "pinned" ? { pinned: true } : {}),
+				...(errors.length > 0 ? { lastErrors: errors } : {}),
 				language,
 				enabled: latest?.enabled ?? true,
 				...(latest?.declinedHash !== undefined ? { declinedHash: latest.declinedHash } : {}),
@@ -506,7 +626,7 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 			const failed = result.failed.length;
 			notifyOn(
 				currentUi,
-				`팁을 ${language}로 번역했습니다 (${count}개${failed > 0 ? `, 실패 ${failed}개` : ""})`,
+				`팁을 ${language}로 번역했습니다 (${count}개${failed > 0 ? `, 실패 ${failed}개` : ""} · ${result.models.join(", ")})`,
 				"info",
 			);
 			requestRender();
@@ -518,7 +638,7 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 		}
 	};
 
-	const pickModel = async (ctx: Context, current?: ModelRef): Promise<Model | undefined> => {
+	const pickModel = async (ctx: Context, current?: ModelRef): Promise<Source | undefined> => {
 		const registry = ctx.modelRegistry;
 		const models: Model[] = [];
 		const add = (model: Model | undefined) => {
@@ -535,14 +655,11 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 				// An unavailable registry leaves the current model as the only option.
 			}
 		}
-		if (models.length === 0) {
-			notify("번역에 사용할 모델이 없습니다. 팁은 영어로 표시됩니다.", "warning");
-			return undefined;
-		}
-		const labels = models.map(modelLabel);
-		const choice = await ui?.select?.("번역에 사용할 모델을 고르세요", labels);
+		const choice = await ui?.select?.("번역에 사용할 모델을 고르세요", [QUICK, ...models.map(modelLabel)]);
 		if (!choice) return undefined;
-		return models.find((model) => modelLabel(model) === choice) ?? models[0];
+		if (choice === QUICK) return { kind: "quick" };
+		const model = models.find((known) => modelLabel(known) === choice);
+		return model ? { kind: "pinned", model: { provider: model.provider, id: model.id } } : undefined;
 	};
 
 	const pickLanguage = async (current?: string): Promise<string | undefined> => {
@@ -558,34 +675,23 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 	};
 
 	const startFirstRun = async (ctx: Context): Promise<void> => {
-		const model = await pickModel(ctx, ctx.model);
-		if (!model) return;
 		const language = await pickLanguage();
 		if (!language) return;
 		await translate(ctx, {
 			language,
-			model: { provider: model.provider, id: model.id },
+			source: { kind: "quick" },
 			targets: templates,
 			includeFixed: true,
 		});
 	};
 
-	const runCommandTranslation = async (ctx: Context, language: string, base?: StoreData): Promise<void> => {
-		const modelRef = base?.model ?? (ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined);
-		let model = modelRef;
-		if (!model) {
-			const picked = await pickModel(ctx);
-			if (!picked) return;
-			model = { provider: picked.provider, id: picked.id };
-		}
+	const runCommandTranslation = async (ctx: Context, language: string, source: Source): Promise<void> => {
 		await translate(ctx, {
 			language,
-			model,
+			source,
 			targets: templates,
 			includeFixed: true,
-			preferFreshModel: false,
 			replaceEntries: true,
-			requireModelMatch: true,
 			adoptExisting: false,
 		});
 	};
@@ -618,7 +724,6 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 				diffTemplates(templates, fresh?.table ?? { prefix: PREFIX_EN, pointer: POINTER_EN, entries: {} }),
 			includeFixed: false,
 			useFreshSettings: true,
-			preferFreshModel: true,
 		});
 	};
 
@@ -695,7 +800,7 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 
 				const argument = typeof args === "string" ? args.trim() : "";
 				if (argument.length > 0) {
-					await runCommandTranslation(ctx, argument, store);
+					await runCommandTranslation(ctx, argument, sourceOf(store));
 					return;
 				}
 
@@ -716,22 +821,19 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 				if (choice === "언어 바꾸기") {
 					const language = await pickLanguage(store.language);
 					if (!language) return;
-					await runCommandTranslation(ctx, language, store);
+					await runCommandTranslation(ctx, language, sourceOf(store));
 					return;
 				}
 
 				if (choice === "모델 바꾸기") {
-					const model = await pickModel(ctx, store.model);
-					if (!model) return;
-					await runCommandTranslation(ctx, store.language, {
-						...store,
-						model: { provider: model.provider, id: model.id },
-					});
+					const source = await pickModel(ctx, store.model);
+					if (!source) return;
+					await runCommandTranslation(ctx, store.language, source);
 					return;
 				}
 
 				if (choice === "다시 번역") {
-					await runCommandTranslation(ctx, store.language, store);
+					await runCommandTranslation(ctx, store.language, sourceOf(store));
 					return;
 				}
 
@@ -757,9 +859,12 @@ export default async function tipsTranslate(pi: ExtensionApi): Promise<void> {
 
 				if (choice === "상태") {
 					const failed = diffTemplates(templates, store.table).length;
+					const source = store.pinned ? `고정 ${modelLabel(store.model)}` : QUICK;
+					const errors = store.lastErrors ?? [];
 					notify(
-						`언어: ${store.language} · 모델: ${modelLabel(store.model)} · OMO: ${store.omoVersion} · ` +
-							`번역 ${Object.keys(store.table.entries).length}개 · 실패 ${failed}개`,
+						`언어: ${store.language} · 모델: ${source} · 번역한 모델: ${modelLabel(store.model)} · ` +
+							`OMO: ${store.omoVersion} · 번역 ${Object.keys(store.table.entries).length}개 · 실패 ${failed}개` +
+							(errors.length > 0 ? `\n최근 오류: ${formatErrors(errors)}` : ""),
 						"info",
 					);
 				}

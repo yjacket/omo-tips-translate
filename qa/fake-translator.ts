@@ -1,7 +1,11 @@
 // Deterministic QA provider for the live replay. Translation requests arrive as a
 // JSON object in the last user message; every value is mapped to "번역:" + value
 // with its {n} tokens kept exactly. Chat turns get a plain delayed reply so the
-// working tip stays on screen long enough to capture.
+// working tip stays on screen long enough to capture. `fake-broken` fails every
+// request the way a spent subscription does: the stream ends with an error.
+// With FAKE_TRANSLATOR_LOG set, each request appends { model, cwd, translation }.
+import { appendFileSync } from "node:fs";
+
 import {
 	calculateCost,
 	createAssistantMessageEventStream,
@@ -10,6 +14,8 @@ import {
 
 const PROVIDER = "fake-translator";
 const MODEL = "fake-translator-1";
+const BROKEN = "fake-broken";
+const BROKEN_ERROR = "fake quota exhausted for this account";
 const CHAT_DELAY_MS = 6000;
 const TRANSLATE_DELAY_MS = 80;
 
@@ -73,7 +79,7 @@ function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
 	});
 }
 
-function streamFake(model: any, context: Context, options?: { signal?: AbortSignal }) {
+function streamFake(model: any, context: Context, options?: { signal?: AbortSignal; cwd?: string }) {
 	const stream = createAssistantMessageEventStream();
 	const output: any = {
 		role: "assistant",
@@ -98,6 +104,11 @@ function streamFake(model: any, context: Context, options?: { signal?: AbortSign
 			stream.push({ type: "start", partial: output });
 			void getCurrentSystemPrompt(context.messages);
 			const reply = replyFor(context);
+			const log = process.env.FAKE_TRANSLATOR_LOG;
+			if (log) {
+				appendFileSync(log, `${JSON.stringify({ model: model.id, cwd: options?.cwd ?? null, translation: reply.translation })}\n`);
+			}
+			if (model.id === BROKEN) throw new Error(BROKEN_ERROR);
 			await sleep(reply.translation ? TRANSLATE_DELAY_MS : CHAT_DELAY_MS, options?.signal);
 			output.content.push({ type: "text", text: reply.text });
 			stream.push({ type: "text_start", contentIndex: 0, partial: output });
@@ -128,6 +139,15 @@ export default function fakeTranslator(pi: any): void {
 			{
 				id: MODEL,
 				name: "Fake Translator",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 16384,
+			},
+			{
+				id: BROKEN,
+				name: "Fake Broken",
 				reasoning: true,
 				input: ["text"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },

@@ -3,11 +3,20 @@ import type { Entry } from "./match";
 
 export type Complete = (system: string, user: string) => Promise<string>;
 
+// One model of the chain, tried in order. `label` is "provider/id".
+export type Candidate = { label: string; complete: Complete };
+
+export type ModelError = { model: string; error: string };
+
 export type TranslateResult = {
 	entries: Record<string, Entry>;
 	prefix?: string;
 	pointer?: string;
 	failed: string[];
+	// Labels of the models whose replies were used, in the order they were used.
+	models: string[];
+	// The last error of every model that was given up on, in chain order.
+	errors: ModelError[];
 };
 
 const PREFIX_KEY = "__prefix";
@@ -72,6 +81,24 @@ function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Pro
 	});
 }
 
+const SECRET_PATTERNS = [
+	/\b(Bearer|Basic)\s+\S+/gi,
+	/\b(sk|pk|rk|ghp|gho|ghs|xox[abp])[-_][A-Za-z0-9_-]{8,}/g,
+	/\b(api[_-]?key|token|secret|password|authorization)\b\s*[:=]\s*\S+/gi,
+	/[A-Za-z0-9+/_-]{32,}={0,2}/g,
+];
+const ERROR_LIMIT = 160;
+
+// One line, no credentials, short enough for a notice: error text from a
+// provider may echo request headers or keys.
+export function cleanError(error: unknown): string {
+	let text = error instanceof Error ? error.message : String(error);
+	text = text.replace(/\s+/g, " ").trim();
+	for (const pattern of SECRET_PATTERNS) text = text.replace(pattern, "…");
+	if (text.length === 0) text = "알 수 없는 오류";
+	return text.length > ERROR_LIMIT ? `${text.slice(0, ERROR_LIMIT - 1)}…` : text;
+}
+
 function chunk<T>(values: T[], size: number): T[][] {
 	const batches: T[][] = [];
 	for (let i = 0; i < values.length; i += size) {
@@ -127,13 +154,13 @@ export function parseReply(reply: string): Record<string, string> | undefined {
 export async function translateTemplates(opts: {
 	templates: TipTemplate[];
 	language: string;
-	complete: Complete;
+	models: Candidate[];
 	includeFixed: boolean;
 	batchSize?: number;
 	onProgress?: (done: number, total: number) => void;
 	signal?: AbortSignal;
 }): Promise<TranslateResult> {
-	const { templates, language, complete, includeFixed, onProgress, signal } = opts;
+	const { templates, language, models, includeFixed, onProgress, signal } = opts;
 	const batchSize =
 		typeof opts.batchSize === "number" && opts.batchSize > 0
 			? Math.floor(opts.batchSize)
@@ -155,30 +182,48 @@ export async function translateTemplates(opts: {
 	const done = new Set<string>();
 	const entries: Record<string, Entry> = {};
 
+	const used: string[] = [];
+	const errors = new Map<string, string>();
 	if (total === 0) {
 		onProgress?.(0, 0);
-		return { entries, failed: [] };
+		return { entries, failed: [], models: used, errors: [] };
 	}
 
 	const progress = () => onProgress?.(done.size, total);
+
+	// The chain stays on the first model that answers. A model that throws or
+	// sends no JSON object is given up on for the rest of the run, and the same
+	// batch goes to the next model; bad keys in a parsed reply are left to the
+	// retry pass with the same model.
+	let current = 0;
+	const ask = async (prompt: { system: string; user: string }): Promise<Record<string, string> | undefined> => {
+		while (current < models.length) {
+			const model = models[current]!;
+			try {
+				const reply = await raceAbort(model.complete(prompt.system, prompt.user), signal);
+				throwIfAborted(signal);
+				const parsed = parseReply(reply);
+				if (parsed) {
+					if (!used.includes(model.label)) used.push(model.label);
+					return parsed;
+				}
+				errors.set(model.label, "응답이 JSON 객체가 아닙니다");
+			} catch (error) {
+				if (isAbortError(error)) throw error;
+				throwIfAborted(signal);
+				errors.set(model.label, cleanError(error));
+			}
+			current++;
+		}
+		return undefined;
+	};
 
 	const runBatch = async (batch: string[]): Promise<string[]> => {
 		throwIfAborted(signal);
 		const asked: Record<string, string> = {};
 		for (const id of batch) asked[id] = items[id]!;
 
-		const prompt = buildPrompt(language, asked);
-		let reply: string;
-		try {
-			reply = await raceAbort(complete(prompt.system, prompt.user), signal);
-		} catch (error) {
-			if (isAbortError(error)) throw error;
-			throwIfAborted(signal);
-			return batch;
-		}
-		throwIfAborted(signal);
-
-		const parsed = parseReply(reply);
+		const parsed = await ask(buildPrompt(language, asked));
 		if (!parsed) return batch;
 
 		const bad: string[] = [];
@@ -209,13 +254,19 @@ export async function translateTemplates(opts: {
 		}
 		for (const id of failed) done.add(id);
 		progress();
-		return finalize(entries, failed);
+		return finalize(entries, failed, used, models, errors);
 	}
 
-	return finalize(entries, []);
+	return finalize(entries, [], used, models, errors);
 }
 
-function finalize(entries: Record<string, Entry>, failedIds: string[]): TranslateResult {
+function finalize(
+	entries: Record<string, Entry>,
+	failedIds: string[],
+	used: string[],
+	models: Candidate[],
+	errors: Map<string, string>,
+): TranslateResult {
 	const fixedPrefix = entries[PREFIX_KEY];
 	const fixedPointer = entries[POINTER_KEY];
 	const translatedEntries: Record<string, Entry> = {};
@@ -223,7 +274,15 @@ function finalize(entries: Record<string, Entry>, failedIds: string[]): Translat
 		if (id !== PREFIX_KEY && id !== POINTER_KEY) translatedEntries[id] = entry;
 	}
 
-	const result: TranslateResult = { entries: translatedEntries, failed: [...failedIds].sort() };
+	const result: TranslateResult = {
+		entries: translatedEntries,
+		failed: [...failedIds].sort(),
+		models: used,
+		errors: models.flatMap((model) => {
+			const error = errors.get(model.label);
+			return error === undefined ? [] : [{ model: model.label, error }];
+		}),
+	};
 	if (fixedPrefix) result.prefix = fixedPrefix.tr;
 	if (fixedPointer) result.pointer = fixedPointer.tr;
 	return result;

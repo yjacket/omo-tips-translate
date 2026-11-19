@@ -22,11 +22,19 @@ export type Table = {
   entries: Record<string, Entry>;
 };
 
+export type ModelError = { model: string; error: string };
+
 export type StoreData = {
   version: 1;
   omoVersion: string;
   sourceHash: string;
+  // The model that translated last. With `pinned` it is also the only model
+  // used; otherwise every translation resolves the routing `quick` chain. A
+  // store without `pinned` (written before the chain existed) follows quick.
   model: { provider: string; id: string };
+  pinned?: boolean;
+  // Last error per model from the latest translation that had any.
+  lastErrors?: ModelError[];
   language: string;
   enabled: boolean;
   declinedHash?: string;
@@ -53,6 +61,18 @@ function isStoreData(value: unknown): value is StoreData {
   if (typeof value.enabled !== "boolean") return false;
   if (typeof value.updatedAt !== "string") return false;
   if (value.declinedHash !== undefined && typeof value.declinedHash !== "string") return false;
+  if (value.pinned !== undefined && typeof value.pinned !== "boolean") return false;
+  if (
+    value.lastErrors !== undefined &&
+    !(
+      Array.isArray(value.lastErrors) &&
+      value.lastErrors.every(
+        (item) => isRecord(item) && typeof item.model === "string" && typeof item.error === "string",
+      )
+    )
+  ) {
+    return false;
+  }
 
   const model = value.model;
   if (!isRecord(model) || typeof model.provider !== "string" || typeof model.id !== "string") {

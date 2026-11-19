@@ -36,12 +36,22 @@ function runtimeRoot(source = CATALOG): string {
 	return root;
 }
 
+// The quick chain reads <home>/.omo/omo.jsonc; tests never see the real one.
+const realHome = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+
 afterEach(() => {
+	for (const [key, value] of Object.entries(realHome)) {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
 	for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 beforeEach(() => {
 	shared[IMPL] = undefined;
+	const home = tempDir();
+	process.env.HOME = home;
+	process.env.USERPROFILE = home;
 });
 
 type Model = { provider: string; id: string };
@@ -120,7 +130,7 @@ class FakeUi {
 	}
 }
 
-type Complete = (system: string, user: string) => Promise<string>;
+type Complete = (system: string, user: string, model: Model) => Promise<string>;
 
 function flush(): Promise<void> {
 	return new Promise((resolve) => setImmediate(resolve));
@@ -142,12 +152,15 @@ function translatedJson(system: string, user: string): string {
 	return JSON.stringify(out);
 }
 
-function makeRegistry(options: { complete?: Complete; available?: Model[] } = {}) {
+const SESSION_CWD_ERROR = "Anthropic Subscription requires an absolute session cwd; the host working directory is never used.";
+
+function makeRegistry(options: { complete?: Complete; available?: Model[]; requireCwd?: boolean } = {}) {
 	const available = options.available ?? [
 		{ provider: "fake", id: "translator" },
 		{ provider: "fake", id: "other" },
+		{ provider: "fake", id: "broken" },
 	];
-	const calls: Array<{ system: string; user: string }> = [];
+	const calls: Array<{ system: string; user: string; model: string }> = [];
 	const complete = options.complete ?? (async (system, user) => translatedJson(system, user));
 	return {
 		calls,
@@ -155,16 +168,42 @@ function makeRegistry(options: { complete?: Complete; available?: Model[] } = {}
 			getAvailable: () => available,
 			find: (provider: string, id: string) => available.find((model) => model.provider === provider && model.id === id),
 			hasConfiguredAuth: () => true,
-			complete: async (model: Model, context: { systemPrompt?: string; messages: unknown[] }) => {
+			complete: async (
+				model: Model,
+				context: { systemPrompt?: string; messages: unknown[] },
+				request: { cwd?: string } = {},
+			) => {
 				const message = context.messages[0] as { content: Array<{ text: string }> };
 				const system = context.systemPrompt ?? "";
 				const user = message.content[0]!.text;
-				calls.push({ system, user });
-				const text = await complete(system, user);
+				calls.push({ system, user, model: `${model.provider}/${model.id}` });
+				// Like senpi's provider boundary: a failed request resolves with the reason, not a throw.
+				if (options.requireCwd && !request.cwd) {
+					return { content: [], stopReason: "error", errorMessage: SESSION_CWD_ERROR, model };
+				}
+				const text = await complete(system, user, model);
 				return { content: [{ type: "text", text }], stopReason: "stop", model };
 			},
 		},
 	};
+}
+
+// A stand-in for the installed omo-routing extension whose resolution yields `chain`
+// as the effective quick category.
+function installRouting(agentDir: string, chain: string[]): void {
+	const dir = join(agentDir, "git", "github.com", "yjacket", "omo-routing", "extension");
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(
+		join(dir, "routing.ts"),
+		[
+			"export const parseJsonc = (src: string) => JSON.parse(src);",
+			"export const applyProfile = (raw: unknown) => ({ config: raw });",
+			"export const resolveProfileName = () => undefined;",
+			'export const loadBuiltinRouting = () => ({ status: "unavailable", reason: "test" });',
+			`export const resolveRouting = () => ({ config: { categories: { quick: { models: ${JSON.stringify(chain)} } } }, sources: { categories: { quick: "configured" } } });`,
+		].join("\n"),
+		"utf8",
+	);
 }
 
 function makeStore(options: {
@@ -175,6 +214,7 @@ function makeStore(options: {
 	entries?: Record<string, { en: string; tr: string }>;
 	enabled?: boolean;
 	declinedHash?: string;
+	pinned?: boolean;
 }): StoreData {
 	const model = options.model ?? { provider: "fake", id: "translator" };
 	const data: StoreData = {
@@ -185,6 +225,7 @@ function makeStore(options: {
 		language: options.language ?? "한국어",
 		enabled: options.enabled ?? true,
 		...(options.declinedHash !== undefined ? { declinedHash: options.declinedHash } : {}),
+		...(options.pinned !== undefined ? { pinned: options.pinned } : {}),
 		table: {
 			prefix: `«${options.language ?? "한국어"}» ${PREFIX_EN}`,
 			pointer: `«${options.language ?? "한국어"}» ${POINTER_EN}`,
@@ -216,7 +257,7 @@ function makeHost(options: HostOptions = {}) {
 	const ui = options.ui ?? new FakeUi();
 	const agentDir = options.agentDir ?? tempDir();
 	const root = options.root ?? runtimeRoot();
-	const model = options.model ?? { provider: "fake", id: "original" };
+	const model = options.model ?? { provider: "fake", id: "translator" };
 	const registry = options.registry ?? makeRegistry().registry;
 	const senpi: Record<string, unknown> = {
 		VERSION: options.version ?? "9.9.9",
@@ -231,7 +272,7 @@ function makeHost(options: HostOptions = {}) {
 		model,
 		registry,
 		senpi,
-		ctx: { mode: "tui", agentDir, model, modelRegistry: registry, ui },
+		ctx: { mode: "tui", cwd: root, agentDir, model, modelRegistry: registry, ui } as Record<string, unknown>,
 	};
 }
 
@@ -348,18 +389,23 @@ describe("tips-translate original-preserving render hook", () => {
 });
 
 describe("tips-translate session flow", () => {
-	test("first run selects model and language, writes the store, and translates tip and pointer text", async () => {
-		const host = makeHost();
+	test("first run asks only the language and translates through the quick chain", async () => {
+		const registry = makeRegistry();
+		const host = makeHost({ registry: registry.registry, model: { provider: "fake", id: "other" } });
+		installRouting(host.agentDir, ["fake/translator:low", "fake/other"]);
 		const done = host.ui.waitFor(/번역했습니다/);
-		host.ui.selectQueue.push("fake/translator", "한국어");
+		host.ui.selectQueue.push("한국어");
 		await load(host).then((api) => api.fire("session_start"));
 		await done;
 
-		expect(host.ui.selects.length).toBe(2);
-		expect(host.ui.selects[0]).toContain("fake/translator");
+		expect(host.ui.selects.length).toBe(1);
+		expect(host.ui.selects[0]).toContain("한국어");
+		expect(registry.calls.map((call) => call.model)).toEqual(["fake/translator"]);
 		const saved = readStore(storePath(host.agentDir)).data!;
 		expect(saved.language).toBe("한국어");
 		expect(saved.model).toEqual({ provider: "fake", id: "translator" });
+		expect(saved.pinned).toBeUndefined();
+		expect(saved.lastErrors).toBeUndefined();
 		expect(saved.sourceHash).toBe(catalogHash);
 		expect(saved.omoVersion).toBe("9.9.9");
 		expect(Object.keys(saved.table.entries).sort()).toEqual(["hello", "key"]);
@@ -498,7 +544,7 @@ describe("tips-translate session flow", () => {
 		const registry = makeRegistry();
 
 		const firstUi = new FakeUi();
-		firstUi.selectQueue.push("fake/translator", "한국어");
+		firstUi.selectQueue.push("한국어");
 		const first = await load(makeHost({ root, agentDir, ui: firstUi, registry: registry.registry }));
 
 		const pendingSelects: Array<(value: string | undefined) => void> = [];
@@ -513,9 +559,6 @@ describe("tips-translate session flow", () => {
 		await firstDone;
 
 		const adopted = secondUi.waitFor(/다른 세션이 번역한 결과를 사용합니다/);
-		pendingSelects.shift()!("fake/translator");
-		await flush();
-		expect(pendingSelects.length).toBe(1);
 		pendingSelects.shift()!("한국어");
 		await adopted;
 
@@ -540,14 +583,14 @@ describe("tips-translate session flow", () => {
 		});
 
 		const firstUi = new FakeUi();
-		firstUi.selectQueue.push("fake/translator", "한국어");
+		firstUi.selectQueue.push("한국어");
 		const first = await load(makeHost({ root, agentDir, ui: firstUi, registry: registry.registry }));
 		const firstDone = firstUi.waitFor(/번역했습니다/);
 		await first.fire("session_start");
 		await started.promise;
 
 		const secondUi = new FakeUi();
-		secondUi.selectQueue.push("fake/translator", "한국어");
+		secondUi.selectQueue.push("한국어");
 		const second = await load(makeHost({ root, agentDir, ui: secondUi, registry: registry.registry }));
 		const held = secondUi.waitFor(/다른 세션이 팁을 번역 중입니다/);
 		await second.fire("session_start");
@@ -628,7 +671,7 @@ describe("tips-translate session flow", () => {
 			},
 		});
 		const host = makeHost({ registry: registry.registry });
-		host.ui.selectQueue.push("fake/translator", "한국어");
+		host.ui.selectQueue.push("한국어");
 		const done = host.ui.waitFor(/번역했습니다/);
 		await load(host).then((api) => api.fire("session_start"));
 		await started.promise;
@@ -648,7 +691,7 @@ describe("tips-translate session flow", () => {
 			},
 		});
 		const host = makeHost({ registry: registry.registry });
-		host.ui.selectQueue.push("fake/translator", "한국어");
+		host.ui.selectQueue.push("한국어");
 		const failed = host.ui.waitFor(/번역하지 못했습니다/);
 		await load(host).then((api) => api.fire("session_start"));
 		await failed;
@@ -660,7 +703,7 @@ describe("tips-translate session flow", () => {
 		expect(text.text).toBe("Tip: Hello world");
 	});
 
-	test("a failing model call during a changed-catalog translation leaves the saved store byte-for-byte intact", async () => {
+	test("a failing model call during a changed-catalog translation keeps the saved table and records the reason", async () => {
 		const host = makeHost({
 			registry: makeRegistry({
 				complete: async () => {
@@ -668,15 +711,140 @@ describe("tips-translate session flow", () => {
 				},
 			}).registry,
 		});
-		makeStore({ agentDir: host.agentDir, source: "older-hash", entries: {} });
-		const path = storePath(host.agentDir);
-		const before = readFileSync(path, "utf8");
+		const before = makeStore({ agentDir: host.agentDir, source: "older-hash", entries: {} });
 		host.ui.confirmQueue.push(true);
 		const failed = host.ui.waitFor(/번역하지 못했습니다/);
 		await load(host).then((api) => api.fire("session_start"));
-		await failed;
-		expect(readFileSync(path, "utf8")).toBe(before);
+		expect(await failed).toContain("provider unavailable");
+		const saved = readStore(storePath(host.agentDir)).data!;
+		expect(saved.table).toEqual(before.table);
+		expect(saved.sourceHash).toBe("older-hash");
+		expect(saved.model).toEqual(before.model);
+		expect(saved.lastErrors?.some((item) => item.error === "provider unavailable")).toBe(true);
 		expect(host.ui.notices.some((notice) => notice.level === "error")).toBe(true);
+	});
+});
+
+describe("tips-translate model chain", () => {
+	const changedCatalogHost = (options: { registry: ReturnType<typeof makeRegistry>; store?: Partial<Parameters<typeof makeStore>[0]> }) => {
+		const host = makeHost({ registry: options.registry.registry });
+		makeStore({ agentDir: host.agentDir, source: "older-hash", entries: {}, ...options.store });
+		host.ui.confirmQueue.push(true);
+		return host;
+	};
+
+	test("a failing first quick model falls through to the next, which is saved as the translating model", async () => {
+		const registry = makeRegistry({
+			complete: async (system, user, model) => {
+				if (model.id === "broken") throw new Error("usage limit reached");
+				return translatedJson(system, user);
+			},
+		});
+		const host = changedCatalogHost({ registry });
+		// A rung this session has no model for is skipped without counting as a failure.
+		installRouting(host.agentDir, ["nope/unconnected", "fake/broken:low", "fake/translator:medium"]);
+		const done = host.ui.waitFor(/번역했습니다/);
+		const api = await load(host);
+		await api.fire("session_start");
+		expect(await done).toContain("fake/translator");
+
+		expect(registry.calls.map((call) => call.model)).toEqual(["fake/broken", "fake/translator"]);
+		const saved = readStore(storePath(host.agentDir)).data!;
+		expect(saved.model).toEqual({ provider: "fake", id: "translator" });
+		expect(saved.lastErrors).toEqual([{ model: "fake/broken", error: "usage limit reached" }]);
+		expect(Object.keys(saved.table.entries).sort()).toEqual(["hello", "key"]);
+
+		host.ui.selectQueue.push("상태");
+		await api.command("");
+		const status = host.ui.notices.at(-1)!.message;
+		expect(status).toContain("모델: quick (자동)");
+		expect(status).toContain("번역한 모델: fake/translator");
+		expect(status).toContain("fake/broken: usage limit reached");
+	});
+
+	test("when every quick model fails the notice and the status name each model's reason", async () => {
+		const registry = makeRegistry({
+			complete: async (_system, _user, model) => {
+				throw new Error(model.id === "broken" ? "usage limit reached" : "rate limited");
+			},
+		});
+		const host = changedCatalogHost({ registry });
+		installRouting(host.agentDir, ["fake/broken", "fake/other"]);
+		const failed = host.ui.waitFor(/번역하지 못했습니다/);
+		const api = await load(host);
+		await api.fire("session_start");
+		const notice = await failed;
+		expect(notice).toContain("fake/broken: usage limit reached");
+		expect(notice).toContain("fake/other: rate limited");
+
+		host.ui.selectQueue.push("상태");
+		await api.command("");
+		const status = host.ui.notices.at(-1)!.message;
+		expect(status).toContain("최근 오류: fake/broken: usage limit reached · fake/other: rate limited");
+	});
+
+	test("without omo-routing the session model translates and the status says why", async () => {
+		const registry = makeRegistry();
+		const host = makeHost({ registry: registry.registry, model: { provider: "fake", id: "other" } });
+		host.ui.selectQueue.push("한국어");
+		const done = host.ui.waitFor(/번역했습니다/);
+		await load(host).then((api) => api.fire("session_start"));
+		await done;
+
+		expect(registry.calls.map((call) => call.model)).toEqual(["fake/other"]);
+		const saved = readStore(storePath(host.agentDir)).data!;
+		expect(saved.model).toEqual({ provider: "fake", id: "other" });
+		expect(saved.pinned).toBeUndefined();
+		expect(saved.lastErrors).toEqual([{ model: "quick", error: "omo-routing이 설치되어 있지 않습니다" }]);
+	});
+
+	test("a pinned model is the only model asked, even with a quick chain", async () => {
+		const registry = makeRegistry();
+		const host = changedCatalogHost({ registry, store: { model: { provider: "fake", id: "other" }, pinned: true } });
+		installRouting(host.agentDir, ["fake/translator"]);
+		const done = host.ui.waitFor(/번역했습니다/);
+		await load(host).then((api) => api.fire("session_start"));
+		await done;
+
+		expect(registry.calls.map((call) => call.model)).toEqual(["fake/other"]);
+		const saved = readStore(storePath(host.agentDir)).data!;
+		expect(saved.pinned).toBe(true);
+		expect(saved.model).toEqual({ provider: "fake", id: "other" });
+	});
+
+	test("a store from before the chain existed follows quick instead of its first-run model", async () => {
+		const registry = makeRegistry({
+			available: [
+				{ provider: "fake", id: "translator" },
+				{ provider: "fake", id: "first-run-pick" },
+			],
+		});
+		const host = changedCatalogHost({ registry, store: { model: { provider: "fake", id: "first-run-pick" } } });
+		installRouting(host.agentDir, ["fake/translator"]);
+		const done = host.ui.waitFor(/번역했습니다/);
+		await load(host).then((api) => api.fire("session_start"));
+		await done;
+
+		expect(registry.calls.map((call) => call.model)).toEqual(["fake/translator"]);
+		const saved = readStore(storePath(host.agentDir)).data!;
+		expect(saved.model).toEqual({ provider: "fake", id: "translator" });
+		expect(saved.pinned).toBeUndefined();
+	});
+
+	test("the session cwd reaches the provider, and a provider error is shown instead of an empty reply", async () => {
+		const registry = makeRegistry({ requireCwd: true });
+		const host = changedCatalogHost({ registry, store: { pinned: true } });
+		const done = host.ui.waitFor(/번역했습니다/);
+		await load(host).then((api) => api.fire("session_start"));
+		await done;
+
+		const bare = changedCatalogHost({ registry: makeRegistry({ requireCwd: true }), store: { pinned: true } });
+		delete bare.ctx.cwd;
+		const failed = bare.ui.waitFor(/번역하지 못했습니다/);
+		await load(bare).then((api) => api.fire("session_start"));
+		const notice = await failed;
+		expect(notice).toContain("requires an absolute session cwd");
+		expect(notice).not.toContain("비어 있습니다");
 	});
 });
 
@@ -740,8 +908,30 @@ describe("tips-translate command", () => {
 		await api.command("");
 		await done;
 
-		expect(registry.calls.length).toBe(1);
-		expect(readStore(storePath(host.agentDir)).data!.model).toEqual({ provider: "fake", id: "other" });
+		expect(host.ui.selects.at(-1)).toContain("quick (자동)|fake/translator");
+		expect(registry.calls.map((call) => call.model)).toEqual(["fake/other"]);
+		const saved = readStore(storePath(host.agentDir)).data!;
+		expect(saved.model).toEqual({ provider: "fake", id: "other" });
+		expect(saved.pinned).toBe(true);
+	});
+
+	test("choosing quick in the menu unpins the model", async () => {
+		const registry = makeRegistry();
+		const host = makeHost({ registry: registry.registry });
+		makeStore({ agentDir: host.agentDir, model: { provider: "fake", id: "other" }, pinned: true });
+		installRouting(host.agentDir, ["fake/translator"]);
+		const api = await load(host);
+		await api.fire("session_start");
+
+		host.ui.selectQueue.push("모델 바꾸기", "quick (자동)");
+		const done = host.ui.waitFor(/번역했습니다/);
+		await api.command("");
+		await done;
+
+		expect(registry.calls.map((call) => call.model)).toEqual(["fake/translator"]);
+		const saved = readStore(storePath(host.agentDir)).data!;
+		expect(saved.pinned).toBeUndefined();
+		expect(saved.model).toEqual({ provider: "fake", id: "translator" });
 	});
 
 	test("turning off in the menu restores English and turning on translates again", async () => {
@@ -775,7 +965,7 @@ describe("tips-translate command", () => {
 		await api.command("");
 		const status = host.ui.notices.at(-1)!.message;
 		expect(status).toContain("한국어");
-		expect(status).toContain("fake/translator");
+		expect(status).toContain("번역한 모델: fake/translator");
 		expect(status).toContain("9.9.9");
 		expect(status).toContain("번역 2개");
 	});
