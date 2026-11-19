@@ -21,6 +21,8 @@ omo install git:github.com/yjacket/omo-tips-translate
 
 omo clones the repository into `~/.omo/agent/git/github.com/yjacket/omo-tips-translate` and adds it to `packages` in `~/.omo/agent/settings.json`. Type `/reload` in running sessions.
 
+To translate through the `quick` chain, also install [omo-routing](https://github.com/yjacket/omo-routing) from git (`omo install git:github.com/yjacket/omo-routing`). This extension imports its `extension/routing.ts` at translation time. Without it, or when that file fails to load or no longer exports the functions used, the session's current model translates and **Status** says why.
+
 Or use the convenience scripts, which run the same command:
 
 ```powershell

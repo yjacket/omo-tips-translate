@@ -188,22 +188,27 @@ function makeRegistry(options: { complete?: Complete; available?: Model[]; requi
 	};
 }
 
-// A stand-in for the installed omo-routing extension whose resolution yields `chain`
-// as the effective quick category.
-function installRouting(agentDir: string, chain: string[]): void {
+// Stand-ins for the installed omo-routing extension. The working one resolves the
+// quick category to the chain stored in chain.json beside it.
+const ROUTING_SOURCES = {
+	working: [
+		'import { readFileSync } from "node:fs";',
+		'const chain = JSON.parse(readFileSync(new URL("./chain.json", import.meta.url), "utf8"));',
+		"export const parseJsonc = (src: string) => JSON.parse(src);",
+		"export const applyProfile = (raw: unknown) => ({ config: raw });",
+		"export const resolveProfileName = () => undefined;",
+		'export const loadBuiltinRouting = () => ({ status: "unavailable", reason: "test" });',
+		'export const resolveRouting = () => ({ config: { categories: { quick: { models: chain } } }, sources: { categories: { quick: "configured" } } });',
+	].join("\n"),
+	throwing: 'throw new Error("broken install");',
+	renamed: "export const resolveChains = () => ({});",
+} as const;
+
+function installRouting(agentDir: string, chain: string[], kind: keyof typeof ROUTING_SOURCES = "working"): void {
 	const dir = join(agentDir, "git", "github.com", "yjacket", "omo-routing", "extension");
 	mkdirSync(dir, { recursive: true });
-	writeFileSync(
-		join(dir, "routing.ts"),
-		[
-			"export const parseJsonc = (src: string) => JSON.parse(src);",
-			"export const applyProfile = (raw: unknown) => ({ config: raw });",
-			"export const resolveProfileName = () => undefined;",
-			'export const loadBuiltinRouting = () => ({ status: "unavailable", reason: "test" });',
-			`export const resolveRouting = () => ({ config: { categories: { quick: { models: ${JSON.stringify(chain)} } } }, sources: { categories: { quick: "configured" } } });`,
-		].join("\n"),
-		"utf8",
-	);
+	writeFileSync(join(dir, "chain.json"), JSON.stringify(chain), "utf8");
+	writeFileSync(join(dir, "routing.ts"), ROUTING_SOURCES[kind], "utf8");
 }
 
 function makeStore(options: {
@@ -797,6 +802,24 @@ describe("tips-translate model chain", () => {
 		expect(saved.pinned).toBeUndefined();
 		expect(saved.lastErrors).toEqual([{ model: "quick", error: "omo-routing이 설치되어 있지 않습니다" }]);
 	});
+
+	for (const [kind, reason] of [
+		["throwing", "quick 체인을 읽지 못했습니다: broken install"],
+		["renamed", "omo-routing에서 체인 해석 함수를 찾지 못했습니다"],
+	] as const) {
+		test(`an omo-routing that is ${kind} falls back to the session model`, async () => {
+			const registry = makeRegistry();
+			const host = makeHost({ registry: registry.registry, model: { provider: "fake", id: "other" } });
+			installRouting(host.agentDir, ["fake/translator"], kind);
+			host.ui.selectQueue.push("한국어");
+			const done = host.ui.waitFor(/번역했습니다/);
+			await load(host).then((api) => api.fire("session_start"));
+			await done;
+
+			expect(registry.calls.map((call) => call.model)).toEqual(["fake/other"]);
+			expect(readStore(storePath(host.agentDir)).data!.lastErrors).toEqual([{ model: "quick", error: reason }]);
+		});
+	}
 
 	test("a pinned model is the only model asked, even with a quick chain", async () => {
 		const registry = makeRegistry();

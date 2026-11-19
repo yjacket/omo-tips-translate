@@ -21,6 +21,8 @@ omo install git:github.com/yjacket/omo-tips-translate
 
 omo가 저장소를 `~/.omo/agent/git/github.com/yjacket/omo-tips-translate`에 클론하고 `~/.omo/agent/settings.json`의 `packages`에 등록합니다. 실행 중인 세션에서 `/reload`를 입력하세요.
 
+`quick` 체인으로 번역하려면 [omo-routing](https://github.com/yjacket/omo-routing)도 git으로 설치하세요(`omo install git:github.com/yjacket/omo-routing`). 이 확장은 번역할 때 그 `extension/routing.ts`를 불러옵니다. 설치되어 있지 않거나, 그 파일을 불러오지 못하거나, 쓰는 함수가 더 이상 없으면 지금 세션의 모델이 번역하고 **상태**에 이유가 나옵니다.
+
 편의 스크립트도 있습니다. 같은 명령을 실행합니다.
 
 ```powershell
