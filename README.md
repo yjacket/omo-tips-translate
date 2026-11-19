@@ -2,7 +2,7 @@
 
 English | [한국어](README.ko.md)
 
-An OMO (senpi) extension that shows the TUI tips in the language you choose. "Tip:" lines at startup and while the agent works, plus the `↳ Want the full story…` pointer line, are replaced with translations made by your own model. Values OMO computes at render time, such as key chords and the app name, stay exactly right. Nothing in the OMO runtime is modified: the extension swaps text only while it is drawn, and removing the extension puts the original English back.
+An OMO (senpi) extension that shows the TUI tips in the language you choose. "Tip:" lines at startup and while the agent works, plus the `↳ Want the full story…` pointer line, are replaced with translations made by your own models, through OMO's `quick` routing category by default. Values OMO computes at render time, such as key chords and the app name, stay exactly right. Nothing in the OMO runtime is modified: the extension swaps text only while it is drawn, and removing the extension puts the original English back.
 
 ## What you see
 
@@ -20,6 +20,8 @@ omo install git:github.com/yjacket/omo-tips-translate
 ```
 
 omo clones the repository into `~/.omo/agent/git/github.com/yjacket/omo-tips-translate` and adds it to `packages` in `~/.omo/agent/settings.json`. Type `/reload` in running sessions.
+
+To translate through the `quick` chain, also install [omo-routing](https://github.com/yjacket/omo-routing) from git (`omo install git:github.com/yjacket/omo-routing`). This extension imports its `extension/routing.ts` at translation time. Without it, or when that file fails to load or no longer exports the functions used, the session's current model translates and **Status** says why.
 
 Or use the convenience scripts, which run the same command:
 
@@ -39,10 +41,7 @@ curl -fsSL https://raw.githubusercontent.com/yjacket/omo-tips-translate/main/ins
 
 ## First run
 
-With no saved translation, the extension asks two questions in the TUI:
-
-1. **Model** - the model used for translation. Your current model is listed first. Any model available in the session can be picked.
-2. **Language** - 한국어, 日本語, 简体中文, 繁體中文, Español, Français, Deutsch, Português, Русский, or a language typed in directly.
+With no saved translation, the extension asks one question in the TUI: the **language** - 한국어, 日本語, 简体中文, 繁體中文, Español, Français, Deutsch, Português, Русский, or a language typed in directly. The models come from the `quick` category (see [Translation model](#translation-model)).
 
 The answer is saved, and translation runs in the background. Failures are reported but do not block the session; tips that could not be translated stay in English.
 
@@ -50,15 +49,25 @@ After an OMO update changes the tip catalog, the extension asks once whether to 
 
 In print, JSON, and RPC modes there are no prompts. The saved table is used as is.
 
+## Translation model
+
+By default every translation follows the `quick` category, resolved when the translation starts. The chain is read the way `/routing` shows it: OMO's builtin chain, then `~/.omo/omo.jsonc` with its `[native]` section and the active profile. This needs [omo-routing](https://github.com/yjacket/omo-routing) installed from git. Models of the chain that this session has no sign-in for are skipped. The rest are tried in order: a model that fails or sends no usable reply is dropped for that run, and the same batch goes to the next model.
+
+When the chain cannot be read (omo-routing missing, a parse error, an empty or disabled `quick`), the session's current model translates, then the model that translated last.
+
+`/tips-translate` → **Change model** can pin one model instead. A pinned model is the only one used until you pick `quick (자동)` in the same menu.
+
+When a model fails, the reason (one line, credentials removed) is shown in the failure notice and kept for **Status**.
+
 ## `/tips-translate`
 
 Run it with no arguments to open the menu:
 
 - **Change language** - pick another language and translate again.
-- **Change model** - pick a different model for future translations.
+- **Change model** - pin one model, or pick `quick (자동)` to follow the quick chain again. Translates again with the choice.
 - **Translate again** - rebuild the table from the current catalog.
 - **Turn off / Turn on** - stop or resume replacing tip text. Turning it off keeps the saved table.
-- **Status** - show language, model, OMO version, translated item count, and failed count.
+- **Status** - show language, model source (quick or pinned), the model that translated last, OMO version, translated item count, failed count, and the latest model errors.
 
 `/tips-translate <language>` skips the menu and translates into that language immediately, for example `/tips-translate 한국어` or `/tips-translate Español`.
 
@@ -70,9 +79,9 @@ Translations live in one file shared by every session:
 ~/.omo/agent/omo-tips-translate.json
 ```
 
-The agent directory follows OMO's normal overrides (`OMO_CODING_AGENT_DIR`, `SENPI_CODING_AGENT_DIR`, `PI_CODING_AGENT_DIR`). The file records the OMO version, a hash of the original tips, the model, the language, whether the extension is enabled, and an `en`/`tr` pair for each tip. Writes are atomic, and a 10-minute lock keeps several sessions opening at once from translating the same catalog twice.
+The agent directory follows OMO's normal overrides (`OMO_CODING_AGENT_DIR`, `SENPI_CODING_AGENT_DIR`, `PI_CODING_AGENT_DIR`). The file records the OMO version, a hash of the original tips, the model that translated last, `pinned` when that model was pinned, the latest model errors, the language, whether the extension is enabled, and an `en`/`tr` pair for each tip. A file written before the quick chain existed has no `pinned` field, so it follows quick: its model was the first-run pick, and a model changed on purpose back then cannot be told apart from it. Pin it again under **Change model** if you want it. Writes are atomic, and a 10-minute lock keeps several sessions opening at once from translating the same catalog twice.
 
-The file is yours to delete. Deleting it makes the next session ask for a model and language again.
+The file is yours to delete. Deleting it makes the next session ask for the language again.
 
 ## How it works and safety
 
@@ -89,7 +98,7 @@ The extension wraps `Text.prototype.render` from `@earendil-works/pi-tui`, the p
 
 - It relies on a pi-tui internal. An OMO update may remove that seam, in which case tips stay English and one warning is shown.
 - Only tip lines and their pointer line are translated. Other UI text is untouched.
-- A model without credentials, or a translation reply that cannot be validated, leaves the affected tips in English.
+- When every model fails, or a translation reply cannot be validated, the affected tips stay English.
 
 ## Development
 

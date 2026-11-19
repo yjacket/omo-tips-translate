@@ -3,9 +3,14 @@ import { POINTER_EN, PREFIX_EN, type TipTemplate } from "../src/extract";
 import {
 	buildPrompt,
 	parseReply,
+	cleanError,
 	translateTemplates,
 	type Complete,
 } from "../src/translate";
+
+function one(complete: Complete, label = "fake/model") {
+	return { label, complete };
+}
 
 function template(id: string, en: string): TipTemplate {
 	return { id, en, slots: (en.match(/\{\d+\}/g) ?? []).length };
@@ -70,7 +75,7 @@ describe("translateTemplates", () => {
 		const result = await translateTemplates({
 			templates: [template("hello", "Hello"), template("stop", "Press {0} to stop.")],
 			language: "한국어",
-			complete: fake.complete,
+			models: [one(fake.complete)],
 			includeFixed: true,
 		});
 
@@ -91,7 +96,7 @@ describe("translateTemplates", () => {
 		const result = await translateTemplates({
 			templates: [template("hello", "Hello")],
 			language: "한국어",
-			complete: fake.complete,
+			models: [one(fake.complete)],
 			includeFixed: false,
 		});
 
@@ -112,7 +117,7 @@ describe("translateTemplates", () => {
 		const result = await translateTemplates({
 			templates: [template("hello", "Hello")],
 			language: "한국어",
-			complete,
+			models: [one(complete)],
 			includeFixed: false,
 		});
 
@@ -129,7 +134,7 @@ describe("translateTemplates", () => {
 		const result = await translateTemplates({
 			templates: [template("stop", "Press {0} to stop.")],
 			language: "한국어",
-			complete: fake.complete,
+			models: [one(fake.complete)],
 			includeFixed: false,
 		});
 
@@ -146,7 +151,7 @@ describe("translateTemplates", () => {
 		const result = await translateTemplates({
 			templates: [template("stop", "Press {0} to stop.")],
 			language: "한국어",
-			complete: fake.complete,
+			models: [one(fake.complete)],
 			includeFixed: false,
 		});
 
@@ -164,7 +169,7 @@ describe("translateTemplates", () => {
 		const result = await translateTemplates({
 			templates: [template("hello", "Hello"), template("run", "Run {0} then {1}.")],
 			language: "한국어",
-			complete: fake.complete,
+			models: [one(fake.complete)],
 			includeFixed: false,
 			batchSize: 10,
 		});
@@ -194,7 +199,7 @@ describe("translateTemplates", () => {
 				template("number", "Number"),
 			],
 			language: "한국어",
-			complete,
+			models: [one(complete)],
 			includeFixed: false,
 		});
 
@@ -208,7 +213,7 @@ describe("translateTemplates", () => {
 		const result = await translateTemplates({
 			templates: [template("hello", "Hello")],
 			language: "한국어",
-			complete,
+			models: [one(complete)],
 			includeFixed: false,
 		});
 
@@ -224,7 +229,7 @@ describe("translateTemplates", () => {
 		const result = await translateTemplates({
 			templates,
 			language: "한국어",
-			complete: fake.complete,
+			models: [one(fake.complete)],
 			includeFixed: true,
 			batchSize: 2,
 			onProgress: (done, total) => progress.push([done, total]),
@@ -246,7 +251,7 @@ describe("translateTemplates", () => {
 			await translateTemplates({
 				templates: [template("hello", "Hello")],
 				language: "한국어",
-				complete: fake.complete,
+				models: [one(fake.complete)],
 				includeFixed: false,
 				signal: controller.signal,
 			});
@@ -270,7 +275,7 @@ describe("translateTemplates", () => {
 		const pending = translateTemplates({
 			templates: [template("hello", "Hello")],
 			language: "한국어",
-			complete,
+			models: [one(complete)],
 			includeFixed: false,
 			signal: controller.signal,
 		});
@@ -291,10 +296,80 @@ describe("translateTemplates", () => {
 			translateTemplates({
 				templates: [template("hello", "Hello")],
 				language: "한국어",
-				complete,
+				models: [one(complete)],
 				includeFixed: false,
 				signal: controller.signal,
 			}),
 		).rejects.toMatchObject({ name: "AbortError" });
+	});
+});
+
+describe("translateTemplates model chain", () => {
+	const failing = (message: string): Complete => async () => {
+		throw new Error(message);
+	};
+
+	test("a throwing first model hands the same batch to the next and is not asked again", async () => {
+		let brokenCalls = 0;
+		const broken: Complete = async () => {
+			brokenCalls++;
+			throw new Error("quota exceeded");
+		};
+		const fake = translator();
+		const result = await translateTemplates({
+			templates: [template("hello", "Hello"), template("stop", "Press {0} to stop.")],
+			language: "한국어",
+			models: [one(broken, "a/broken"), one(fake.complete, "b/good")],
+			includeFixed: false,
+			batchSize: 1,
+		});
+
+		expect(brokenCalls).toBe(1);
+		expect(fake.count()).toBe(2);
+		expect(Object.keys(result.entries).sort()).toEqual(["hello", "stop"]);
+		expect(result.models).toEqual(["b/good"]);
+		expect(result.errors).toEqual([{ model: "a/broken", error: "quota exceeded" }]);
+	});
+
+	test("a reply that is not a JSON object moves on to the next model", async () => {
+		const fake = translator();
+		const result = await translateTemplates({
+			templates: [template("hello", "Hello")],
+			language: "한국어",
+			models: [one(async () => "", "a/empty"), one(fake.complete, "b/good")],
+			includeFixed: false,
+		});
+
+		expect(result.entries.hello).toEqual({ en: "Hello", tr: "안녕하세요" });
+		expect(result.models).toEqual(["b/good"]);
+		expect(result.errors.map((item) => item.model)).toEqual(["a/empty"]);
+	});
+
+	test("when every model fails the result is empty and each model's last error is kept in chain order", async () => {
+		const result = await translateTemplates({
+			templates: [template("hello", "Hello")],
+			language: "한국어",
+			models: [one(failing("no auth"), "a/one"), one(failing("rate limited"), "b/two")],
+			includeFixed: false,
+		});
+
+		expect(result.entries).toEqual({});
+		expect(result.failed).toEqual(["hello"]);
+		expect(result.models).toEqual([]);
+		expect(result.errors).toEqual([
+			{ model: "a/one", error: "no auth" },
+			{ model: "b/two", error: "rate limited" },
+		]);
+	});
+});
+
+describe("cleanError", () => {
+	test("keeps one short line and hides credentials", () => {
+		const text = cleanError(new Error("401 from api\nAuthorization: Bearer abc.def.ghi key sk-ant-0123456789abcdef"));
+		expect(text).not.toContain("\n");
+		expect(text).not.toContain("abc.def.ghi");
+		expect(text).not.toContain("sk-ant-0123456789abcdef");
+		expect(text).toContain("401 from api");
+		expect(cleanError("x".repeat(500)).length).toBeLessThanOrEqual(160);
 	});
 });

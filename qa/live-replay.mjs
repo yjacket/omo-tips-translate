@@ -1,14 +1,19 @@
 // Isolated live replay of the omo-tips-translate extension in the bundled Senpi
 // engine CLI. Every scenario gets its own temporary agent dir (all
-// brandEnvNames("CODING_AGENT_DIR") variants), a 150x45 PTY, and no prompt typed
-// unless the working tip needs a turn. Nothing touches the user's real agent dir.
+// brandEnvNames("CODING_AGENT_DIR") variants) and home (HOME, USERPROFILE,
+// APPDATA, LOCALAPPDATA), an environment rebuilt without OMO_/SENPI_/PI_/HERDR_
+// variables, a 150x45 PTY, and no prompt typed unless the working tip needs a
+// turn. Nothing touches the user's real agent dir or omo.jsonc.
 //
 // Scenarios:
 //   E  baseline without the tips extension: capture English startup/working tips and key values
 //   A  translated startup tip, pointer, reasoning notice, and working tip
-//   B  first run: model select, language select, background progress, store creation
+//   B  first run: language select only, background progress, store creation (no omo-routing: session model)
 //   C  changed sourceHash: one re-translate confirmation
 //   D  corrupt store: English fallback, no TypeError
+//   F  changed catalog through the quick chain: a copy of the installed omo-routing reads a
+//      temporary omo.jsonc whose quick chain starts with a failing fake model; the next model
+//      translates the changed tips, and /tips-translate 상태 names both
 import {
 	cpSync,
 	existsSync,
@@ -25,7 +30,11 @@ import { pathToFileURL } from "node:url";
 
 const REPO = new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1").replace(/[\\/]$/, "");
 const SENPI_DIST =
-	process.env.SENPI_DIST ?? "C:/Users/yjack/.omo/agent/runtime/0b0c6ca88f3a3632-7e186e28b781/dist";
+	process.env.SENPI_DIST ?? "C:/Users/yjack/.bun/install/global/node_modules/@code-yeongyu/senpi/dist";
+// The installed omo-routing, copied read-only into scenario F's agent dir.
+const ROUTING_SRC =
+	process.env.OMO_ROUTING_DIR ?? "C:/Users/yjack/.omo/agent/git/github.com/yjacket/omo-routing";
+const OMO_BIN = process.env.OMO_BIN;
 const CLI = join(SENPI_DIST, "bundle/cli.js");
 const COLS = 150;
 const ROWS = 45;
@@ -93,8 +102,16 @@ function history() {
 }
 
 const agentEnv = Object.fromEntries(brandEnvNames("CODING_AGENT_DIR").map((name) => [name, null]));
-function envFor(agent) {
-	const env = { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" };
+const DROPPED = /^(OMO_|SENPI_|PI_|HERDR_)/i;
+function envFor(agent, home, log) {
+	const env = {};
+	for (const [key, value] of Object.entries(process.env)) if (!DROPPED.test(key)) env[key] = value;
+	Object.assign(env, { TERM: "xterm-256color", COLORTERM: "truecolor", FAKE_TRANSLATOR_LOG: log });
+	for (const name of ["HOME", "USERPROFILE"]) env[name] = home;
+	env.APPDATA = join(home, "AppData", "Roaming");
+	env.LOCALAPPDATA = join(home, "AppData", "Local");
+	// omo-routing reads the builtin chains from the installed OMO next to this file.
+	if (OMO_BIN) env.OMO_BIN = OMO_BIN;
 	for (const name of Object.keys(agentEnv)) env[name] = agent;
 	for (const legacy of ["OMO_CODING_AGENT_DIR", "SENPI_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"]) {
 		env[legacy] = agent;
@@ -102,9 +119,21 @@ function envFor(agent) {
 	return env;
 }
 
-function prepareAgent(name, { store } = {}) {
+function prepareAgent(name, { store, quick } = {}) {
 	const agent = join(ROOT, name, "agent");
+	const home = join(ROOT, name, "home");
 	mkdirSync(agent, { recursive: true });
+	mkdirSync(join(home, "AppData", "Roaming"), { recursive: true });
+	mkdirSync(join(home, "AppData", "Local"), { recursive: true });
+	if (quick !== undefined) {
+		mkdirSync(join(home, ".omo"), { recursive: true });
+		writeFileSync(
+			join(home, ".omo", "omo.jsonc"),
+			`// scenario ${name}\n${JSON.stringify({ "[native]": { categories: { quick: { models: quick } } } }, null, 2)}\n`,
+		);
+		const target = join(agent, "git", "github.com", "yjacket", "omo-routing");
+		for (const part of ["package.json", "extension"]) cpSync(join(ROUTING_SRC, part), join(target, part), { recursive: true });
+	}
 	writeFileSync(
 		join(agent, "settings.json"),
 		JSON.stringify(
@@ -127,14 +156,20 @@ function prepareAgent(name, { store } = {}) {
 			typeof store === "string" ? store : JSON.stringify(store, null, 2),
 		);
 	}
-	return agent;
+	return { agent, home };
 }
 
 const scenarios = [];
 const ptyReceipts = [];
 
 async function run(name, options) {
-	const agent = prepareAgent(name, options);
+	const { agent, home } = prepareAgent(name, options);
+	const log = join(ROOT, name, "requests.jsonl");
+	const env = envFor(agent, home, log);
+	for (const key of ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", ...Object.keys(agentEnv)]) {
+		if (!env[key].startsWith(ROOT)) throw new Error(`${name}: ${key}=${env[key]} is outside the run root`);
+	}
+	console.log(`${name}: HOME=${env.HOME} agent=${agent}`);
 	const argv = [
 		process.execPath,
 		CLI,
@@ -154,7 +189,7 @@ async function run(name, options) {
 	const waiters = new Set();
 	const proc = Bun.spawn(argv, {
 		cwd: REPO,
-		env: envFor(agent),
+		env,
 		terminal: {
 			cols: COLS,
 			rows: ROWS,
@@ -230,7 +265,10 @@ async function run(name, options) {
 		return end;
 	};
 
-	return { name, agent, argv, proc, total: () => total, raw, plain, waitFor, waitIdle, send, kill, marks, mark };
+	const requests = () =>
+		existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
+
+	return { name, agent, argv, proc, total: () => total, raw, plain, waitFor, waitIdle, send, kill, marks, mark, requests };
 }
 
 const waitForStore = async (path, maxMs = 60000) => {
@@ -301,15 +339,12 @@ try {
 }
 scenarios.push({ ...scenarioA });
 
-// Scenario B: first run, driven through model and language selects.
+// Scenario B: first run, driven through the language select.
 const scenarioB = await run("B", { tips: true });
 const storeB = join(scenarioB.agent, "omo-tips-translate.json");
 let storeDataB;
 try {
-	const modelAt = await scenarioB.waitFor(0, /번역에 사용할 모델을 고르세요/, 90000);
-	await scenarioB.mark("model-select", 700);
-	scenarioB.send("\r");
-	const languageAt = await scenarioB.waitFor(modelAt, /팁을 표시할 언어를 고르세요/, 30000);
+	const languageAt = await scenarioB.waitFor(0, /팁을 표시할 언어를 고르세요/, 90000);
 	await scenarioB.mark("language-select", 700);
 	const selectedAt = scenarioB.send("\r");
 	await scenarioB.waitFor(selectedAt, /🌐 팁/, 30000);
@@ -318,7 +353,7 @@ try {
 	await scenarioB.mark("done", 1500);
 	const text = scenarioB.plain().slice(languageAt);
 	storeDataB = found ? JSON.parse(readFileSync(storeB, "utf8")) : undefined;
-	check("B", "model select dialog shown", /번역에 사용할 모델을 고르세요/.test(scenarioB.plain()));
+	check("B", "no model select dialog", !/번역에 사용할 모델을 고르세요/.test(scenarioB.plain()));
 	check("B", "language select dialog shown", /팁을 표시할 언어를 고르세요/.test(scenarioB.plain()));
 	check("B", "status line showed 🌐 팁", text.includes("🌐 팁"));
 	check("B", "translation completion notice shown", text.includes("번역했습니다"));
@@ -326,13 +361,18 @@ try {
 	check("B", "store model is fake provider", storeDataB?.model?.provider === "fake-translator" && storeDataB?.model?.id === "fake-translator-1");
 	check("B", "store language is 한국어", storeDataB?.language === "한국어");
 	check("B", "store omoVersion recorded", typeof storeDataB?.omoVersion === "string" && storeDataB.omoVersion.length > 0);
+	check("B", "store follows quick (not pinned)", storeDataB?.pinned === undefined);
+	check("B", "fallback reason recorded", storeDataB?.lastErrors?.[0]?.model === "quick", JSON.stringify(storeDataB?.lastErrors));
 } finally {
 	await scenarioB.kill();
 }
 scenarios.push({ ...scenarioB });
 
-// Scenario C: stale sourceHash asks once.
-const scenarioC = await run("C", { tips: true, store: makeStore({ sourceHash: "stale-hash" }) });
+// Scenario C: stale sourceHash with a tip missing from the table asks once (a catalog
+// that only dropped tips is adopted without asking).
+const tableC = makeTable();
+delete tableC.entries[STARTUP_TIP];
+const scenarioC = await run("C", { tips: true, store: makeStore({ sourceHash: "stale-hash", table: tableC }) });
 try {
 	await scenarioC.waitFor(0, /omo 업데이트로 팁이 바뀌었습니다\. 새 팁을 번역할까요\?/, 90000);
 	await scenarioC.mark("confirm", 900);
@@ -359,6 +399,53 @@ try {
 	await scenarioD.kill();
 }
 scenarios.push({ ...scenarioD });
+
+// Scenario F: the catalog gained tips since a first-run store; quick's first model fails.
+const CHANGED = ["ethos.ulw-plan-sage", "ethos.ulw-loop-shallow", "model-cycling-scope"];
+const staleTable = makeTable();
+for (const id of CHANGED) delete staleTable.entries[id];
+const scenarioF = await run("F", {
+	tips: true,
+	store: makeStore({ sourceHash: "stale-hash", table: staleTable }),
+	quick: ["fake-translator/fake-broken:low", "fake-translator/fake-translator-1:low"],
+});
+const storeF = join(scenarioF.agent, "omo-tips-translate.json");
+let storeDataF;
+let requestsF = [];
+try {
+	const confirmAt = await scenarioF.waitFor(0, /새 팁을 번역할까요\?/, 90000);
+	await scenarioF.mark("confirm", 900);
+	scenarioF.send("\r");
+	const doneAt = await scenarioF.waitFor(confirmAt, /번역했습니다|번역하지 못했습니다/, 60000);
+	await scenarioF.mark("translated", 1200);
+	const notice = scenarioF.plain().slice(confirmAt);
+	storeDataF = JSON.parse(readFileSync(storeF, "utf8"));
+	requestsF = scenarioF.requests().filter((request) => request.translation);
+	const menuAt = scenarioF.send("/tips-translate\r");
+	await scenarioF.waitFor(menuAt, /언어 바꾸기/, 30000);
+	await scenarioF.mark("menu", 700);
+	// 상태 is the fifth entry.
+	const statusAt = scenarioF.send("\x1b[B\x1b[B\x1b[B\x1b[B\r");
+	await scenarioF.waitFor(statusAt, /최근 오류/, 30000);
+	await scenarioF.mark("status", 1200);
+	const status = scenarioF.plain().slice(statusAt);
+	check("F", "translation notice names the second model", /번역했습니다 \(3개 · fake-translator\/fake-translator-1\)/.test(notice), notice.slice(-400));
+	check("F", "broken model asked first, then the next", requestsF[0]?.model === "fake-broken" && requestsF[1]?.model === "fake-translator-1", JSON.stringify(requestsF));
+	check("F", "broken model not asked again", requestsF.filter((request) => request.model === "fake-broken").length === 1, JSON.stringify(requestsF));
+	check("F", "session cwd reached the provider", requestsF.every((request) => typeof request.cwd === "string" && request.cwd.length > 0), JSON.stringify(requestsF));
+	check("F", "three changed tips translated", CHANGED.every((id) => storeDataF?.table?.entries?.[id]?.tr?.startsWith("번역:")));
+	check("F", "store records the translating model", storeDataF?.model?.id === "fake-translator-1" && storeDataF?.pinned === undefined);
+	check("F", "store records the broken model's reason", storeDataF?.lastErrors?.[0]?.model === "fake-translator/fake-broken" && /fake quota exhausted/.test(storeDataF?.lastErrors?.[0]?.error ?? ""), JSON.stringify(storeDataF?.lastErrors));
+	check("F", "status shows quick, the translating model and the reason", status.includes("quick (자동)") && status.includes("번역한 모델: fake-translator/fake-translator-1") && /fake-broken: fake quota exhausted/.test(status), status.slice(-600));
+	check("F", "no TypeError", !scenarioF.plain().includes("TypeError"));
+	void doneAt;
+} catch (error) {
+	console.error("F PLAIN TAIL\n" + scenarioF.plain().slice(-8000));
+	throw error;
+} finally {
+	await scenarioF.kill();
+}
+scenarios.push({ ...scenarioF });
 
 // Render each captured mark through xterm.js, then save screen text and raw output.
 mkdirSync(EVIDENCE, { recursive: true });
@@ -415,6 +502,12 @@ if (storeDataB) {
 	writeFileSync(join(EVIDENCE, "live-B-store.json"), JSON.stringify(storeDataB, null, 2));
 	evidenceFiles.push(join(EVIDENCE, "live-B-store.json"));
 }
+if (storeDataF) {
+	const { table, ...rest } = storeDataF;
+	const changed = Object.fromEntries(CHANGED.map((id) => [id, table.entries[id]]));
+	writeFileSync(join(EVIDENCE, "live-F-store.json"), JSON.stringify({ ...rest, changed, requests: requestsF }, null, 2));
+	evidenceFiles.push(join(EVIDENCE, "live-F-store.json"));
+}
 
 // Cleanup and receipts.
 rmSync(ROOT, { recursive: true, force: true });
@@ -446,7 +539,7 @@ for (const result of results) {
 	byScenario.get(result.scenario).push(result);
 }
 let failed = 0;
-for (const name of ["E", "A", "B", "C", "D"]) {
+for (const name of ["E", "A", "B", "C", "D", "F"]) {
 	const checks = byScenario.get(name) ?? [{ label: "scenario ran", ok: false }];
 	const bad = checks.filter((check) => !check.ok);
 	if (bad.length > 0) failed++;
